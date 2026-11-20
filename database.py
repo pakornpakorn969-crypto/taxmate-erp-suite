@@ -1,36 +1,47 @@
 from datetime import datetime
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
 import pandas as pd
-import streamlit as st
 
-DB_NAME = "taxmate.db"
+APP_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+DB_NAME = os.environ.get(
+    "TAXMATE_DB_FILE",
+    os.environ.get(
+        "TAXMATE_LEGACY_DB_FILE",
+        os.path.join(APP_DIRECTORY, "taxmate_erp_v5.db"),
+    ),
+)
+if not os.path.isabs(DB_NAME):
+  DB_NAME = os.path.join(APP_DIRECTORY, DB_NAME)
 
 
 def get_connection():
-  """เชื่อมต่อฐานข้อมูล: ป้องกัน StreamlitSecretNotFoundError ด้วย try...except"""
-  pg_uri = ""
-  try:
-    pg_uri = st.secrets.get("POSTGRES_URL", "")
-  except Exception:
-    pg_uri = os.environ.get("DATABASE_URL", "")
-
-  if pg_uri:
-    try:
-      import psycopg2
-
-      return psycopg2.connect(pg_uri)
-    except Exception as e:
-      print(f"PostgreSQL Connection Error: {e}")
-
+  """เชื่อมต่อฐานข้อมูล SQLite กลางที่ใช้ร่วมกับ app.py"""
   return sqlite3.connect(DB_NAME, check_same_thread=False)
 
 
 def hash_password(password: str) -> str:
-  """เข้ารหัสรหัสผ่านด้วย SHA-256"""
-  return hashlib.sha256(password.encode("utf-8")).hexdigest()
+  """Hash passwords with the same PBKDF2 scheme as app.py."""
+  salt = os.urandom(16)
+  rounds = 260_000
+  digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, rounds)
+  return f"pbkdf2_sha256${rounds}${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+  if stored_hash.startswith("pbkdf2_sha256$"):
+    try:
+      _, rounds, salt_hex, digest_hex = stored_hash.split("$", 3)
+      actual = hashlib.pbkdf2_hmac(
+          "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(rounds)
+      )
+      return hmac.compare_digest(actual.hex(), digest_hex)
+    except (ValueError, TypeError):
+      return False
+  return hmac.compare_digest(hash_password(password), stored_hash)
 
 
 def init_db():
@@ -65,22 +76,32 @@ def init_db():
       ("allowed_modules", "TEXT DEFAULT 'all'"),
       ("last_login", "TEXT"),
       ("created_at", "TEXT"),
+      ("failed_attempts", "INTEGER NOT NULL DEFAULT 0"),
+      ("lockout_until", "TEXT"),
   ]:
-    try:
+    existing_columns = {
+        row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()
+    }
+    if col_name not in existing_columns:
       c.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
-    except Exception:
-      pass
 
   # 2. Audit Logs
   c.execute("""CREATE TABLE IF NOT EXISTS audit_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT NOT NULL,
+        username TEXT,
+        user_name TEXT,
         action TEXT NOT NULL,
         module TEXT,
         details TEXT,
         ip_address TEXT DEFAULT '127.0.0.1',
         timestamp TEXT
     )""")
+  audit_columns = {
+      row[1] for row in c.execute("PRAGMA table_info(audit_logs)").fetchall()
+  }
+  for col_name in ("username", "user_name", "module", "details", "ip_address"):
+    if col_name not in audit_columns:
+      c.execute(f"ALTER TABLE audit_logs ADD COLUMN {col_name} TEXT")
 
   # 3. System Settings
   c.execute("""CREATE TABLE IF NOT EXISTS system_settings (
@@ -274,9 +295,10 @@ def log_audit(
     c = conn.cursor()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     c.execute(
-        """INSERT INTO audit_logs (username, action, module, details, ip_address, timestamp)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (username, action, module, details, ip_address, now_str),
+        """INSERT INTO audit_logs
+           (username, user_name, action, module, details, ip_address, timestamp)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (username, username, action, module, details, ip_address, now_str),
     )
     conn.commit()
     conn.close()
@@ -374,3 +396,7 @@ def restore_db_from_bytes(file_bytes):
     return True, "กู้คืนฐานข้อมูลสำเร็จ!"
   except Exception as e:
     return False, f"เกิดข้อผิดพลาดในการกู้คืน: {e}"
+
+
+# Ensure the schema and demo accounts exist before authentication is used.
+init_db()
