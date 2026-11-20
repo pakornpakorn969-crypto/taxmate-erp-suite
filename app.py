@@ -1,5 +1,5 @@
 # ==============================================================================
-# 🏛️ TaxMate Enterprise ERP Suite v6.7 (Full Master Build - Zero-Error Edition)
+# 🏛️ TaxMate Enterprise ERP Suite v6.9 (Admin & User Portal - Bug-Free Edition)
 # ==============================================================================
 
 import hashlib
@@ -9,6 +9,7 @@ import io
 import math
 import os
 import sqlite3
+import tempfile
 import uuid
 from datetime import date, datetime
 
@@ -19,6 +20,7 @@ import streamlit as st
 
 try:
     import qrcode
+    from PIL import Image  # noqa: F401
 except ImportError:
     qrcode = None
 
@@ -26,7 +28,7 @@ except ImportError:
 # 1. PAGE CONFIGURATION & ENTERPRISE LIGHT 3D THEME
 # ------------------------------------------------------------------------------
 st.set_page_config(
-    page_title="TaxMate Enterprise ERP Suite v6.7 Next-Gen",
+    page_title="TaxMate Enterprise ERP Suite v6.9",
     page_icon="🏛️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -130,6 +132,39 @@ st.markdown(
         box-shadow: inset 0 2px 4px rgba(255,255,255,0.8), 0 6px 12px rgba(37,99,235,0.08);
     }
 
+    .role-badge-admin {
+        display: inline-block;
+        background: #DBEAFE;
+        color: #1E40AF;
+        border: 1px solid #93C5FD;
+        padding: 4px 12px;
+        border-radius: 9999px;
+        font-size: 12.5px;
+        font-weight: 700;
+        margin-bottom: 8px;
+    }
+    .role-badge-user {
+        display: inline-block;
+        background: #DCFCE7;
+        color: #166534;
+        border: 1px solid #86EFAC;
+        padding: 4px 12px;
+        border-radius: 9999px;
+        font-size: 12.5px;
+        font-weight: 700;
+        margin-bottom: 8px;
+    }
+
+    .portal-banner {
+        background: #FFFFFF;
+        border: 1px solid #E2E8F0;
+        border-left: 6px solid #2563EB;
+        border-radius: 16px;
+        padding: 20px 24px;
+        margin-bottom: 20px;
+        box-shadow: 0 4px 12px rgba(15, 23, 42, 0.04);
+    }
+
     [data-testid="stMetricValue"] {
         font-size: 26px !important;
         font-weight: 800 !important;
@@ -170,11 +205,51 @@ st.markdown(
 # 2. FAIL-SAFE DATABASE ENGINE & HELPERS
 # ------------------------------------------------------------------------------
 APP_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.environ.get(
-    "TAXMATE_DB_FILE", os.path.join(APP_DIRECTORY, "taxmate_erp_v5.db")
-)
-if not os.path.isabs(DB_FILE):
-    DB_FILE = os.path.join(APP_DIRECTORY, DB_FILE)
+
+
+def resolve_db_path() -> str:
+    env_path = os.environ.get("TAXMATE_DB_FILE")
+    if env_path:
+        path = (
+            env_path
+            if os.path.isabs(env_path)
+            else os.path.join(APP_DIRECTORY, env_path)
+        )
+        parent = os.path.dirname(path) or APP_DIRECTORY
+        os.makedirs(parent, exist_ok=True)
+        return path
+
+    default_path = os.path.join(APP_DIRECTORY, "taxmate_erp_v5.db")
+    if os.access(APP_DIRECTORY, os.W_OK):
+        return default_path
+    return os.path.join(tempfile.gettempdir(), "taxmate_erp_v5.db")
+
+
+DB_FILE = resolve_db_path()
+
+ROLE_DISPLAY_LABELS = {
+    "Super Admin": "Super Admin (ผู้ดูแลระบบสูงสุด)",
+    "Admin": "Admin (ผู้ดูแลระบบ)",
+    "User": "User (ผู้ใช้งานทั่วไป)",
+    "Executive": "Executive (ผู้บริหาร)",
+    "Accounting": "Accounting (ฝ่ายบัญชี)",
+    "POS": "POS (ฝ่ายขาย / หน้าร้าน)",
+    "HR": "HR (ฝ่ายบุคคล)",
+}
+
+REGISTER_ROLES = ["Admin", "User", "Executive", "Accounting", "POS", "HR"]
+ADMIN_EDIT_ROLES = [
+    "Super Admin",
+    "Admin",
+    "User",
+    "Executive",
+    "Accounting",
+    "POS",
+    "HR",
+]
+ADMIN_ROLES = {"Admin", "Super Admin"}
+APPROVER_ROLES = {"Admin", "Super Admin", "Executive", "Accounting", "HR"}
+ALL_ROLES = {"Admin", "Super Admin", "User", "Executive", "Accounting", "POS", "HR"}
 
 RESETTABLE_TABLE_GROUPS = {
     "🧾 ยอดขายและใบกำกับภาษี (Sales & Payments)": [
@@ -217,9 +292,33 @@ ALL_TRANSACTION_TABLES = [
 ALLOWED_RESET_TABLES = set(ALL_TRANSACTION_TABLES) | {"users"}
 
 
+def format_role_label(role_code: str) -> str:
+    return ROLE_DISPLAY_LABELS.get(role_code, role_code)
+
+
+def set_flash(level: str, message: str):
+    st.session_state["_flash_message"] = (level, message)
+
+
+def show_flash():
+    flash = st.session_state.pop("_flash_message", None)
+    if not flash:
+        return
+    level, message = flash
+    if level == "success":
+        st.success(message)
+    elif level == "warning":
+        st.warning(message)
+    elif level == "error":
+        st.error(message)
+    else:
+        st.info(message)
+
+
 def get_db_connection():
-    conn = sqlite3.connect(DB_FILE, timeout=20)
+    conn = sqlite3.connect(DB_FILE, timeout=20, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 20000")
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
@@ -285,7 +384,7 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 
 def generate_promptpay_payload(target_id: str, amount: float = None) -> str:
-    target = str(target_id or "").replace("-", "").strip()
+    target = str(target_id or "").replace("-", "").replace(" ", "").strip()
     if not target.isdigit() or len(target) not in (10, 13, 15):
         raise ValueError(
             "กรุณาระบุ PromptPay เบอร์มือถือ 10 หลัก เลขประจำตัว 13 หลัก หรือ e-Wallet 15 หลัก"
@@ -300,9 +399,10 @@ def generate_promptpay_payload(target_id: str, amount: float = None) -> str:
     target_type = "01" if len(target) == 10 else ("02" if len(target) == 13 else "03")
     target_fmt = ("0066" + target[1:]) if target_type == "01" else target
 
+    poi_method = "12" if (amount and float(amount) > 0) else "11"
     tag29 = f"0016A000000677010111{target_type}{len(target_fmt):02d}{target_fmt}"
-    payload = f"00020101021229{len(tag29):02d}{tag29}5303764"
-    if amount and amount > 0:
+    payload = f"0002010102{poi_method}29{len(tag29):02d}{tag29}5303764"
+    if amount and float(amount) > 0:
         amt_str = f"{float(amount):.2f}"
         payload += f"54{len(amt_str):02d}{amt_str}"
     payload += "5802TH5911TaxMate ERP6304"
@@ -322,10 +422,14 @@ def generate_promptpay_payload(target_id: str, amount: float = None) -> str:
 def make_qr_png_bytes(payload: str) -> bytes:
     if qrcode is None:
         raise RuntimeError(
-            'ยังไม่ได้ติดตั้งแพ็กเกจ qrcode กรุณารันคำสั่ง: pip install "qrcode[pil]"'
+            'ยังไม่ได้ติดตั้งแพ็กเกจ qrcode[pil] กรุณาเพิ่ม qrcode[pil] ใน requirements.txt'
         )
     buf = io.BytesIO()
-    qrcode.make(payload).save(buf, format="PNG")
+    qr = qrcode.QRCode(border=2, box_size=8)
+    qr.add_data(payload)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    img.save(buf, format="PNG")
     return buf.getvalue()
 
 
@@ -409,7 +513,7 @@ def migrate_legacy_purchase_orders(cursor, archive_name):
                 item_name or "รายการเดิม (ดูข้อมูลสำรอง)",
                 max(int(quantity or 1), 1),
                 float(row_data.get("total_amount") or row_data.get("total") or 0),
-                row_data.get("status") or "Pending",
+                row_data.get("status") or "Pending Approval",
                 row_data.get("branch") or "สำนักงานใหญ่",
                 row_data.get("requested_by"),
                 row_data.get("approved_by"),
@@ -447,6 +551,11 @@ def migrate_legacy_expenses(cursor, archive_name):
 def init_db():
     conn = get_db_connection()
     try:
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.Error:
+            pass
+
         cursor = conn.cursor()
 
         # Table 1: Users
@@ -470,6 +579,9 @@ def init_db():
         ensure_column(cursor, "users", "status", "TEXT NOT NULL DEFAULT 'Active'")
         ensure_column(
             cursor, "users", "allowed_modules", "TEXT NOT NULL DEFAULT 'all'"
+        )
+        cursor.execute(
+            "UPDATE users SET status = 'Active' WHERE status IS NULL OR TRIM(status) = ''"
         )
 
         # Table 2: Sales
@@ -559,7 +671,7 @@ def init_db():
             item_name TEXT NOT NULL,
             qty INTEGER NOT NULL,
             total_amount REAL NOT NULL,
-            status TEXT DEFAULT 'Pending',
+            status TEXT DEFAULT 'Pending Approval',
             branch TEXT DEFAULT 'สำนักงานใหญ่',
             requested_by TEXT,
             approved_by TEXT,
@@ -696,11 +808,6 @@ def init_db():
         )"""
         )
 
-        # เปิดใช้งานทุกบัญชีที่มีอยู่ในฐานข้อมูลให้อัตโนมัติ
-        cursor.execute(
-            "UPDATE users SET status = 'Active' WHERE status IS NULL OR status != 'Active'"
-        )
-
         conn.commit()
     finally:
         conn.close()
@@ -741,7 +848,6 @@ def reset_database_tables(table_names, actor=None, include_extra_tables=False):
 
     conn = get_db_connection()
     try:
-        # ปิด Foreign Key ชั่วคราวก่อนเริ่ม Transaction เพื่อป้องกัน Error จากตารางเก่าตกค้าง
         conn.execute("PRAGMA foreign_keys = OFF")
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
@@ -768,7 +874,6 @@ def reset_database_tables(table_names, actor=None, include_extra_tables=False):
         if not ordered_targets:
             raise ValueError("กรุณาเลือกข้อมูลอย่างน้อย 1 รายการที่ต้องการลบ")
 
-        # ลบคำขออนุมัติที่ผูกกับ PO / Expense หากมีการลบเฉพาะหมวดนั้น
         if "purchase_orders" in target_set and "approvals" not in target_set:
             cursor.execute(
                 "DELETE FROM approvals WHERE doc_type = 'PO' AND document_id IS NOT NULL"
@@ -805,7 +910,9 @@ def reset_database_tables(table_names, actor=None, include_extra_tables=False):
         conn.close()
 
 
-def delete_single_record(table_name: str, record_id: int, actor: str):
+def delete_single_record(
+    table_name: str, record_id: int, actor: str, current_user_id: int = None
+):
     allowed = {
         "sales",
         "products",
@@ -826,7 +933,26 @@ def delete_single_record(table_name: str, record_id: int, actor: str):
         cursor = conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
 
-        if table_name == "sales":
+        if table_name == "users":
+            if current_user_id is not None and int(record_id) == int(current_user_id):
+                raise ValueError("ไม่สามารถลบบัญชีที่กำลังใช้งานอยู่ได้")
+            target = cursor.execute(
+                "SELECT role, status FROM users WHERE id = ?", (record_id,)
+            ).fetchone()
+            if not target:
+                raise ValueError("ไม่พบบัญชีที่ต้องการลบ")
+            if (
+                target["role"] in ADMIN_ROLES
+                and str(target["status"]).strip().casefold() == "active"
+            ):
+                active_admins = cursor.execute(
+                    """SELECT COUNT(*) FROM users
+                       WHERE role IN ('Admin', 'Super Admin')
+                         AND LOWER(TRIM(status)) = 'active'"""
+                ).fetchone()[0]
+                if active_admins <= 1:
+                    raise ValueError("ไม่สามารถลบผู้ดูแลระบบที่ใช้งานอยู่คนสุดท้ายได้")
+        elif table_name == "sales":
             cursor.execute("DELETE FROM sales_payments WHERE sale_id = ?", (record_id,))
         elif table_name == "products":
             cursor.execute(
@@ -974,7 +1100,7 @@ def adjust_inventory_stock(product_id, movement_type, quantity, reference, actor
         ).fetchone()
         if not product:
             raise ValueError("ไม่พบสินค้าในระบบ")
-        current_stock = int(product["stock"])
+        current_stock = int(product["stock"] or 0)
         if movement_type == "Issue" and quantity > current_stock:
             raise ValueError(f"สต็อกไม่เพียงพอ คงเหลือ {current_stock} ชิ้น")
         new_stock = (
@@ -1030,7 +1156,7 @@ def transition_approval(approval_id, status, actor):
         if approval["doc_type"] == "PO" and approval["document_id"] is not None:
             cursor.execute(
                 """UPDATE purchase_orders SET status = ?, approved_by = ?
-                   WHERE id = ? AND status = 'Pending Approval'""",
+                   WHERE id = ? AND status IN ('Pending Approval', 'Pending')""",
                 (status, actor, approval["document_id"]),
             )
         elif approval["doc_type"] == "EXPENSE" and approval["document_id"] is not None:
@@ -1202,25 +1328,30 @@ def pay_payroll_run(run_id):
             raise ValueError("ยอดเงินเดือนและรายการหักไม่สมดุล")
 
         entry_date = date.today().isoformat()
-        journal_entries = [
-            (
-                entry_date,
-                "51000",
-                "ค่าใช้จ่ายเงินเดือน",
-                gross,
-                0.0,
-                f"เงินเดือนรอบ {run['period']}",
-            ),
-            (
-                entry_date,
-                "11100",
-                "เงินสด/เงินฝากธนาคาร",
-                0.0,
-                net,
-                f"จ่ายเงินเดือนรอบ {run['period']}",
-            ),
-        ]
-        if deductions:
+        journal_entries = []
+        if gross > 0:
+            journal_entries.append(
+                (
+                    entry_date,
+                    "51000",
+                    "ค่าใช้จ่ายเงินเดือน",
+                    gross,
+                    0.0,
+                    f"เงินเดือนรอบ {run['period']}",
+                )
+            )
+        if net > 0:
+            journal_entries.append(
+                (
+                    entry_date,
+                    "11100",
+                    "เงินสด/เงินฝากธนาคาร",
+                    0.0,
+                    net,
+                    f"จ่ายเงินเดือนรอบ {run['period']}",
+                )
+            )
+        if deductions > 0:
             journal_entries.append(
                 (
                     entry_date,
@@ -1231,12 +1362,13 @@ def pay_payroll_run(run_id):
                     f"ตั้งหนี้สินรายการหักเงินเดือน {run['period']}",
                 )
             )
-        cursor.executemany(
-            """INSERT INTO journal_entries
-               (entry_date, account_code, account_name, debit, credit, description)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            journal_entries,
-        )
+        if journal_entries:
+            cursor.executemany(
+                """INSERT INTO journal_entries
+                   (entry_date, account_code, account_name, debit, credit, description)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                journal_entries,
+            )
         cursor.execute(
             """UPDATE payroll_runs SET status = 'Paid', paid_at = CURRENT_TIMESTAMP
                WHERE id = ? AND status = 'Draft'""",
@@ -1253,11 +1385,13 @@ def pay_payroll_run(run_id):
         conn.close()
 
 
-try:
-    init_db()
-except (sqlite3.Error, TypeError, ValueError) as error:
-    st.error(f"ไม่สามารถเตรียมฐานข้อมูล ERP ได้: {error}")
-    st.stop()
+if not st.session_state.get("_db_initialized") or not os.path.exists(DB_FILE):
+    try:
+        init_db()
+        st.session_state["_db_initialized"] = True
+    except (sqlite3.Error, TypeError, ValueError) as error:
+        st.error(f"ไม่สามารถเตรียมฐานข้อมูล ERP ได้: {error}")
+        st.stop()
 
 # ------------------------------------------------------------------------------
 # 3. AUTHENTICATION & LANDING PAGE
@@ -1266,7 +1400,10 @@ if "authenticated" not in st.session_state:
     st.session_state.authenticated = False
     st.session_state.user = None
 
-if not st.session_state.authenticated:
+if not st.session_state.authenticated or not st.session_state.user:
+    st.session_state.authenticated = False
+    st.session_state.user = None
+
     conn = get_db_connection()
     try:
         user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -1274,8 +1411,9 @@ if not st.session_state.authenticated:
         conn.close()
 
     if user_count == 0:
-        st.markdown("## 🛡️ ตั้งค่าผู้ดูแลระบบคนแรก")
-        st.info("สร้างบัญชีผู้ดูแลระบบก่อนเริ่มใช้งาน TaxMate ERP")
+        show_flash()
+        st.markdown("## 🛡️ ตั้งค่าผู้ดูแลระบบคนแรก (Initial Admin Setup)")
+        st.info("สร้างบัญชี Admin คนแรกก่อนเริ่มใช้งาน TaxMate ERP")
         with st.form("initial_admin_setup_form"):
             initial_username = st.text_input("ชื่อผู้ดูแลระบบ (Username)")
             initial_name = st.text_input("ชื่อ-นามสกุล")
@@ -1287,7 +1425,7 @@ if not st.session_state.authenticated:
                 "ยืนยันรหัสผ่าน", type="password"
             )
             create_initial_admin = st.form_submit_button(
-                "สร้างบัญชีผู้ดูแลระบบ", type="primary"
+                "สร้างบัญชีผู้ดูแลระบบ (Admin)", type="primary"
             )
         if create_initial_admin:
             if not all(
@@ -1340,7 +1478,7 @@ if not st.session_state.authenticated:
                     log_audit_action(
                         initial_name.strip(), "สร้างบัญชีผู้ดูแลระบบเริ่มต้น"
                     )
-                    st.success("สร้างบัญชีผู้ดูแลระบบเรียบร้อยแล้ว")
+                    set_flash("success", "สร้างบัญชีผู้ดูแลระบบเรียบร้อยแล้ว ยินดีต้อนรับ!")
                     st.rerun()
         st.stop()
 
@@ -1349,23 +1487,28 @@ if not st.session_state.authenticated:
             """
         <div style="padding: 10px 0;">
             <div style="font-size: 40px; margin-bottom: 2px;">🏛️</div>
-            <h2 style="margin: 0; color: #0F172A; font-weight: 800; font-size: 21px;">TaxMate ERP v6.7</h2>
+            <h2 style="margin: 0; color: #0F172A; font-weight: 800; font-size: 21px;">TaxMate ERP v6.9</h2>
         </div>
         """,
             unsafe_allow_html=True,
         )
-        init_nav = st.radio("📍 เมนูระบบ:", ["🏠 หน้าแรก (Overview)", "🔑 เข้าสู่ระบบ"])
+        init_nav = st.radio(
+            "📍 เมนูระบบ:",
+            ["🔑 เข้าสู่ระบบ / สมัครสมาชิก", "🏠 หน้าแรก (Overview)"],
+        )
         st.divider()
         st.caption("🟢 สถานะฐานข้อมูล: เชื่อมต่อ SQLite พร้อมใช้งาน")
+
+    show_flash()
 
     if init_nav == "🏠 หน้าแรก (Overview)":
         st.markdown(
             """
         <div class="hero-container-3d-light">
-            <span class="hero-badge-pill-3d">🏛️ NEXT-GEN LIGHT 3D ERP v6.7</span>
+            <span class="hero-badge-pill-3d">🏛️ NEXT-GEN LIGHT 3D ERP v6.9</span>
             <div class="hero-title-main-light">TaxMate Enterprise ERP Suite</div>
             <div class="hero-subtitle-light">High-Speed Financial & Compliance Management Platform</div>
-            <div class="hero-desc-text-light">ศูนย์กลางบริหารจัดการบัญชี ภาษีไทย e-Tax สต็อกสินค้า CRM ประมาณการรายได้ จัดซื้อ คุมงบประมาณ เงินเดือน ระบบขออนุมัติ และศูนย์จัดการล้างข้อมูลครบวงจร</div>
+            <div class="hero-desc-text-light">รองรับทั้งหน้าผู้ดูแลระบบ (Admin Center) และหน้าผู้ใช้งานทั่วไป (User Portal) พร้อมระบบบัญชี ภาษีไทย e-Tax สต็อกสินค้า CRM จัดซื้อ ค่าใช้จ่าย และเงินเดือนครบวงจร</div>
         </div>
         """,
             unsafe_allow_html=True,
@@ -1380,8 +1523,8 @@ if not st.session_state.authenticated:
                 <div class="icon-box-3d">
                     <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#2563EB" stroke-width="2"><line x1="12" y1="20" x2="12" y2="10"></line><line x1="18" y1="20" x2="18" y2="4"></line><line x1="6" y1="20" x2="6" y2="16"></line></svg>
                 </div>
-                <b>📊 Financial Analytics & GL</b>
-                <span style="font-size: 13.5px; color: #475569;">ลงบัญชีอัตโนมัติ พร้อมงบทดลอง งบกำไรขาดทุน และวิเคราะห์แนวโน้มรายได้แบบ Interactive</span>
+                <b>🛡️ Admin Center & User Portal</b>
+                <span style="font-size: 13.5px; color: #475569;">แยกหน้าผู้ดูแลระบบและหน้าผู้ใช้งานชัดเจน จัดการสิทธิ์ โปรไฟล์ รหัสผ่าน และประวัติการใช้งานได้ครบถ้วน</span>
             </div>
             """,
                 unsafe_allow_html=True,
@@ -1413,12 +1556,16 @@ if not st.session_state.authenticated:
                 unsafe_allow_html=True,
             )
     else:
-        st.markdown("## 🔑 ศูนย์ยืนยันตัวตน (Authentication Center)")
+        st.markdown("## 🔑 ศูนย์ยืนยันตัวตน (Admin & User Login)")
         tab_login, tab_register = st.tabs(
-            ["🔑 เข้าสู่ระบบ (Sign In)", "📝 ลงทะเบียนผู้ใช้งานใหม่ (Sign Up)"]
+            ["🔑 เข้าสู่ระบบ (Sign In)", "📝 ลงทะเบียนบัญชี Admin / User (Sign Up)"]
         )
 
         with tab_login:
+            st.info(
+                "เข้าสู่ระบบได้ทั้งบัญชี **Admin** และ **User** "
+                "ระบบจะเปิดหน้าผู้ดูแลระบบหรือหน้าผู้ใช้งานให้อัตโนมัติตามสิทธิ์ของบัญชี"
+            )
             with st.form("login_form"):
                 u = st.text_input("ชื่อผู้ใช้งาน (Username)")
                 p = st.text_input("รหัสผ่าน (Password)", type="password")
@@ -1440,49 +1587,52 @@ if not st.session_state.authenticated:
 
                     if not database_error:
                         if user and verify_password(p, user["password_hash"]):
-                            if str(user["status"] or "").strip().casefold() != "active":
-                                conn_act = get_db_connection()
-                                try:
-                                    conn_act.execute(
-                                        "UPDATE users SET status = 'Active' WHERE id = ?",
-                                        (user["id"],),
-                                    )
-                                    conn_act.commit()
-                                finally:
-                                    conn_act.close()
-                            user_dict = dict(user)
-                            user_dict["status"] = "Active"
-                            st.session_state.authenticated = True
-                            st.session_state.user = user_dict
-                            st.session_state["login_success_message"] = (
-                                f"ยินดีต้อนรับคุณ {user['full_name']}"
-                            )
-                            log_audit_action(user["full_name"], "เข้าสู่ระบบสำเร็จ")
-                            st.rerun()
+                            status_clean = str(user["status"] or "").strip().casefold()
+                            if status_clean != "active":
+                                st.error(
+                                    f"บัญชีนี้อยู่ในสถานะ '{user['status']}' "
+                                    "กรุณาติดต่อผู้ดูแลระบบเพื่อเปิดใช้งาน"
+                                )
+                            else:
+                                st.session_state.authenticated = True
+                                st.session_state.user = dict(user)
+                                set_flash(
+                                    "success",
+                                    f"ยินดีต้อนรับคุณ {user['full_name']} "
+                                    f"({format_role_label(user['role'])})",
+                                )
+                                log_audit_action(user["full_name"], "เข้าสู่ระบบสำเร็จ")
+                                st.rerun()
                         else:
                             st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
 
         with tab_register:
-            st.info("ลงทะเบียนบัญชีผู้ใช้งานใหม่เพื่อเข้าสู่ระบบได้ทันที")
+            st.info(
+                "เลือกสร้างบัญชี **Admin (ผู้ดูแลระบบ)** หรือ **User (ผู้ใช้งานทั่วไป)** "
+                "เพื่อเข้าสู่ระบบได้ทันที"
+            )
             with st.form("reg_form"):
                 r_u = st.text_input("Username:")
                 r_fn = st.text_input("ชื่อ-นามสกุล:")
                 r_em = st.text_input("อีเมล:")
+                r_dept = st.text_input("แผนก (Department):", value="ทั่วไป")
                 r_role = st.selectbox(
                     "บทบาท (Role):",
-                    ["Admin", "Executive", "Accounting", "POS", "HR"],
+                    REGISTER_ROLES,
+                    index=1,
+                    format_func=format_role_label,
                 )
                 r_p1 = st.text_input(
                     "รหัสผ่าน (อย่างน้อย 4 ตัวอักษร):", type="password"
                 )
-                r_p2 = st.text_input("ยืนยันรหัสผ่าน:", type="password")
+                r_p2 = st.text_input("ยืนยันรหัสผ่าน (กรอกให้ตรงกับด้านบน):", type="password")
                 if st.form_submit_button("สร้างบัญชีใหม่", type="primary"):
                     if not r_u.strip() or not r_fn.strip() or not r_em.strip():
                         st.error("กรุณากรอกชื่อผู้ใช้ ชื่อ-นามสกุล และอีเมลให้ครบ")
                     elif len(r_p1) < 4:
                         st.error("รหัสผ่านต้องมีอย่างน้อย 4 ตัวอักษร")
                     elif r_p1 != r_p2:
-                        st.error("รหัสผ่านและการยืนยันรหัสผ่านไม่ตรงกัน")
+                        st.error("รหัสผ่านและการยืนยันรหัสผ่านไม่ตรงกัน กรุณากรอกทั้ง 2 ช่องให้เหมือนกัน")
                     else:
                         registered = False
                         conn = None
@@ -1491,12 +1641,13 @@ if not st.session_state.authenticated:
                             conn.execute(
                                 """INSERT INTO users
                                    (username, password_hash, full_name, role, department, email, status)
-                                   VALUES (?, ?, ?, ?, 'ทั่วไป', ?, 'Active')""",
+                                   VALUES (?, ?, ?, ?, ?, ?, 'Active')""",
                                 (
                                     r_u.strip(),
                                     hash_password(r_p1),
                                     r_fn.strip(),
                                     r_role,
+                                    r_dept.strip() or "ทั่วไป",
                                     r_em.strip(),
                                 ),
                             )
@@ -1517,7 +1668,10 @@ if not st.session_state.authenticated:
                                 r_fn.strip(),
                                 f"สมัครบัญชีผู้ใช้ใหม่: {r_u.strip()} ({r_role}/Active)",
                             )
-                            st.success("สร้างบัญชีเรียบร้อยแล้ว สามารถเข้าสู่ระบบได้ทันที")
+                            st.success(
+                                f"สร้างบัญชี {r_u.strip()} ({format_role_label(r_role)}) "
+                                "เรียบร้อยแล้ว! สลับไปแท็บ 'เข้าสู่ระบบ' เพื่อล็อกอินได้ทันที"
+                            )
     st.stop()
 
 # ------------------------------------------------------------------------------
@@ -1536,82 +1690,123 @@ finally:
     if conn:
         conn.close()
 
-if not current_user:
+if not current_user or str(current_user["status"] or "").strip().casefold() != "active":
     st.session_state.clear()
     st.session_state.authenticated = False
     st.session_state.user = None
-    st.error("ไม่พบบัญชีนี้ในระบบ กรุณาเข้าสู่ระบบใหม่อีกครั้ง")
-    st.stop()
+    set_flash(
+        "error",
+        "บัญชีของคุณถูกปิดใช้งานหรือถูกลบออกจากระบบ กรุณาเข้าสู่ระบบใหม่อีกครั้ง",
+    )
+    st.rerun()
 
 st.session_state.user = dict(current_user)
-login_success_message = st.session_state.pop("login_success_message", None)
-if login_success_message:
-    st.success(login_success_message)
+user_role = st.session_state.user.get("role", "User")
+is_admin = user_role in ADMIN_ROLES
 
 st.sidebar.title("🏛️ TaxMate ERP Suite")
+if is_admin:
+    st.sidebar.markdown(
+        '<span class="role-badge-admin">🛡️ โหมดผู้ดูแลระบบ (Admin)</span>',
+        unsafe_allow_html=True,
+    )
+else:
+    st.sidebar.markdown(
+        '<span class="role-badge-user">👤 โหมดผู้ใช้งาน (User)</span>',
+        unsafe_allow_html=True,
+    )
+
 st.sidebar.markdown(f"👤 **{safe_text(st.session_state.user.get('full_name'))}**")
 st.sidebar.caption(
-    f"Role: `{safe_text(st.session_state.user.get('role'))}` | "
+    f"Role: `{safe_text(user_role)}` | "
     f"Dept: `{safe_text(st.session_state.user.get('department'))}`"
 )
 st.sidebar.markdown("---")
 
-ALL_ROLES = {"Admin", "Super Admin", "Executive", "Accounting", "POS", "HR"}
+if is_admin:
+    menu_permissions = {
+        "🛡️ หน้าผู้ดูแลระบบ (Admin Center)": ADMIN_ROLES,
+        "👤 หน้าผู้ใช้งาน (User Portal)": ALL_ROLES,
+        "📊 Dashboard Overview": ALL_ROLES,
+        "🧾 e-Tax Invoice & Dynamic QR": ALL_ROLES,
+        "🤝 ระบบลูกค้าสัมพันธ์ (CRM & VIP)": ALL_ROLES,
+        "📈 คาดการณ์ทางการเงิน (Forecast)": {
+            "Admin",
+            "Super Admin",
+            "Executive",
+            "Accounting",
+        },
+        "🛍️ จัดซื้อและคู่ค้า (Purchase Orders)": {
+            "Admin",
+            "Super Admin",
+            "Executive",
+            "Accounting",
+            "User",
+        },
+        "💸 คุมงบประมาณและค่าใช้จ่าย (Expenses)": {
+            "Admin",
+            "Super Admin",
+            "Executive",
+            "Accounting",
+            "User",
+        },
+        "📦 Smart Inventory WMS": {
+            "Admin",
+            "Super Admin",
+            "Accounting",
+            "POS",
+            "User",
+        },
+        "👥 HR & Payroll": {"Admin", "Super Admin", "HR"},
+        "📒 บันทึกบัญชีและงบการเงิน (GL)": {"Admin", "Super Admin", "Accounting"},
+        "🛡️ ระบบขออนุมัติ (E-Approval)": ALL_ROLES,
+        "🗑️ ล้างข้อมูลระบบ (Reset Data)": ADMIN_ROLES,
+    }
+else:
+    menu_permissions = {
+        "👤 หน้าผู้ใช้งาน (User Portal)": ALL_ROLES,
+        "📊 Dashboard Overview": ALL_ROLES,
+        "🧾 e-Tax Invoice & Dynamic QR": {
+            "User",
+            "Executive",
+            "Accounting",
+            "POS",
+        },
+        "🤝 ระบบลูกค้าสัมพันธ์ (CRM & VIP)": {
+            "User",
+            "Executive",
+            "Accounting",
+            "POS",
+        },
+        "📈 คาดการณ์ทางการเงิน (Forecast)": {
+            "Executive",
+            "Accounting",
+        },
+        "🛍️ จัดซื้อและคู่ค้า (Purchase Orders)": {
+            "User",
+            "Executive",
+            "Accounting",
+        },
+        "💸 คุมงบประมาณและค่าใช้จ่าย (Expenses)": {
+            "User",
+            "Executive",
+            "Accounting",
+        },
+        "📦 Smart Inventory WMS": {
+            "User",
+            "Accounting",
+            "POS",
+        },
+        "👥 HR & Payroll": {"HR"},
+        "📒 บันทึกบัญชีและงบการเงิน (GL)": {"Accounting"},
+        "🛡️ ระบบขออนุมัติ (E-Approval)": ALL_ROLES,
+    }
 
-menu_permissions = {
-    "📊 Dashboard Overview": ALL_ROLES,
-    "🧾 e-Tax Invoice & Dynamic QR": {
-        "Admin",
-        "Super Admin",
-        "Executive",
-        "Accounting",
-        "POS",
-    },
-    "🤝 ระบบลูกค้าสัมพันธ์ (CRM & VIP)": {
-        "Admin",
-        "Super Admin",
-        "Executive",
-        "Accounting",
-        "POS",
-    },
-    "📈 คาดการณ์ทางการเงิน (Forecast)": {
-        "Admin",
-        "Super Admin",
-        "Executive",
-        "Accounting",
-    },
-    "🛍️ จัดซื้อและคู่ค้า (Purchase Orders)": {
-        "Admin",
-        "Super Admin",
-        "Executive",
-        "Accounting",
-    },
-    "💸 คุมงบประมาณและค่าใช้จ่าย (Expenses)": {
-        "Admin",
-        "Super Admin",
-        "Executive",
-        "Accounting",
-    },
-    "📦 Smart Inventory WMS": {"Admin", "Super Admin", "Accounting", "POS"},
-    "👥 HR & Payroll": {"Admin", "Super Admin", "HR"},
-    "📒 บันทึกบัญชีและงบการเงิน (GL)": {"Admin", "Super Admin", "Accounting"},
-    "🛡️ ระบบขออนุมัติ (E-Approval)": {
-        "Admin",
-        "Super Admin",
-        "Executive",
-        "Accounting",
-        "HR",
-    },
-    "⚙️ Admin Settings & Audit Logs": {"Admin", "Super Admin"},
-    "🗑️ ล้างข้อมูลระบบ (Reset Data)": ALL_ROLES,
-}
-
-user_role = st.session_state.user.get("role", "")
 available_menus = [
     menu for menu, roles in menu_permissions.items() if user_role in roles
 ]
 if not available_menus:
-    available_menus = list(menu_permissions.keys())
+    available_menus = ["👤 หน้าผู้ใช้งาน (User Portal)", "📊 Dashboard Overview"]
 
 app_menu = st.sidebar.radio("ระบบงานหลัก", available_menus)
 
@@ -1624,11 +1819,233 @@ if st.sidebar.button("🚪 ออกจากระบบ", use_container_width=
     st.rerun()
 
 st.title(app_menu)
+show_flash()
+
+# ------------------------------------------------------------------------------
+# MODULE 0: USER PORTAL (หน้าผู้ใช้งาน)
+# ------------------------------------------------------------------------------
+if app_menu == "👤 หน้าผู้ใช้งาน (User Portal)":
+    st.markdown(
+        f"""
+    <div class="portal-banner">
+        <h3 style="margin:0 0 6px 0; color:#1E3A8A;">👋 ยินดีต้อนรับ, {safe_text(current_user['full_name'])}</h3>
+        <p style="margin:0; color:#475569; font-size:15px;">
+            บัญชีผู้ใช้: <b>{safe_text(current_user['username'])}</b> |
+            บทบาท: <b>{safe_text(format_role_label(current_user['role']))}</b> |
+            แผนก: <b>{safe_text(current_user['department'] or '-')}</b> |
+            อีเมล: <b>{safe_text(current_user['email'] or '-')}</b>
+        </p>
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
+    conn = get_db_connection()
+    try:
+        my_approvals_df = pd.read_sql_query(
+            """SELECT id, doc_type AS 'ประเภท', title AS 'เรื่อง',
+                      amount AS 'งบประมาณ', status AS 'สถานะ',
+                      approved_by AS 'ผู้อนุมัติ', created_at AS 'วันที่ส่ง'
+               FROM approvals
+               WHERE requested_by = ?
+               ORDER BY id DESC LIMIT 200""",
+            conn,
+            params=(current_user["full_name"],),
+        )
+        my_logs_df = pd.read_sql_query(
+            """SELECT timestamp AS 'เวลา', action AS 'กิจกรรมที่ดำเนินการ'
+               FROM audit_logs
+               WHERE user_name = ?
+               ORDER BY id DESC LIMIT 200""",
+            conn,
+            params=(current_user["full_name"],),
+        )
+    finally:
+        conn.close()
+
+    total_my_req = len(my_approvals_df)
+    pending_my_req = (
+        int((my_approvals_df["สถานะ"] == "Pending Approval").sum())
+        if not my_approvals_df.empty
+        else 0
+    )
+    approved_my_req = (
+        int((my_approvals_df["สถานะ"] == "Approved").sum())
+        if not my_approvals_df.empty
+        else 0
+    )
+
+    u1, u2, u3, u4 = st.columns(4)
+    u1.metric("คำขอทั้งหมดของฉัน", f"{total_my_req} รายการ")
+    u2.metric("รอการอนุมัติ", f"{pending_my_req} รายการ")
+    u3.metric("อนุมัติแล้ว", f"{approved_my_req} รายการ")
+    u4.metric("กิจกรรมล่าสุดของฉัน", f"{len(my_logs_df)} รายการ")
+
+    st.markdown("---")
+    ut1, ut2, ut3 = st.tabs(
+        [
+            "👤 โปรไฟล์และเปลี่ยนรหัสผ่าน",
+            "📝 คำขออนุมัติของฉัน",
+            "📜 ประวัติการใช้งานของฉัน",
+        ]
+    )
+
+    with ut1:
+        col_prof, col_pass = st.columns(2)
+        with col_prof:
+            st.subheader("✏️ แก้ไขข้อมูลส่วนตัว")
+            with st.form("user_update_profile_form"):
+                edit_full_name = st.text_input(
+                    "ชื่อ-นามสกุล", value=str(current_user["full_name"] or "")
+                )
+                edit_email = st.text_input(
+                    "อีเมล", value=str(current_user["email"] or "")
+                )
+                edit_dept = st.text_input(
+                    "แผนก", value=str(current_user["department"] or "")
+                )
+                save_profile = st.form_submit_button(
+                    "💾 บันทึกข้อมูลส่วนตัว", type="primary"
+                )
+            if save_profile:
+                if not edit_full_name.strip() or not edit_email.strip():
+                    st.error("กรุณากรอกชื่อ-นามสกุลและอีเมลให้ครบถ้วน")
+                else:
+                    saved_prof = False
+                    conn = get_db_connection()
+                    try:
+                        conn.execute(
+                            """UPDATE users
+                               SET full_name = ?, email = ?, department = ?
+                               WHERE id = ?""",
+                            (
+                                edit_full_name.strip(),
+                                edit_email.strip(),
+                                edit_dept.strip() or "ทั่วไป",
+                                int(current_user["id"]),
+                            ),
+                        )
+                        conn.commit()
+                        saved_prof = True
+                    except sqlite3.Error as error:
+                        safe_rollback(conn)
+                        st.error(f"อัปเดตโปรไฟล์ไม่สำเร็จ: {error}")
+                    finally:
+                        conn.close()
+
+                    if saved_prof:
+                        log_audit_action(
+                            edit_full_name.strip(), "อัปเดตข้อมูลโปรไฟล์ส่วนตัว"
+                        )
+                        set_flash("success", "บันทึกข้อมูลส่วนตัวเรียบร้อยแล้ว")
+                        st.rerun()
+
+        with col_pass:
+            st.subheader("🔒 เปลี่ยนรหัสผ่าน")
+            with st.form("user_change_password_form"):
+                curr_pw = st.text_input("รหัสผ่านปัจจุบัน", type="password")
+                new_pw = st.text_input(
+                    "รหัสผ่านใหม่ (อย่างน้อย 4 ตัวอักษร)", type="password"
+                )
+                confirm_pw = st.text_input("ยืนยันรหัสผ่านใหม่", type="password")
+                change_pw_btn = st.form_submit_button(
+                    "🔑 เปลี่ยนรหัสผ่าน", type="primary"
+                )
+            if change_pw_btn:
+                if not verify_password(curr_pw, current_user["password_hash"]):
+                    st.error("รหัสผ่านปัจจุบันไม่ถูกต้อง")
+                elif len(new_pw) < 4:
+                    st.error("รหัสผ่านใหม่ต้องมีอย่างน้อย 4 ตัวอักษร")
+                elif new_pw != confirm_pw:
+                    st.error("รหัสผ่านใหม่และการยืนยันรหัสผ่านไม่ตรงกัน")
+                else:
+                    changed_ok = False
+                    conn = get_db_connection()
+                    try:
+                        conn.execute(
+                            "UPDATE users SET password_hash = ? WHERE id = ?",
+                            (hash_password(new_pw), int(current_user["id"])),
+                        )
+                        conn.commit()
+                        changed_ok = True
+                    except sqlite3.Error as error:
+                        safe_rollback(conn)
+                        st.error(f"เปลี่ยนรหัสผ่านไม่สำเร็จ: {error}")
+                    finally:
+                        conn.close()
+
+                    if changed_ok:
+                        log_audit_action(
+                            current_user["full_name"], "เปลี่ยนรหัสผ่านบัญชีตนเอง"
+                        )
+                        set_flash("success", "เปลี่ยนรหัสผ่านเรียบร้อยแล้ว")
+                        st.rerun()
+
+    with ut2:
+        st.subheader("➕ ส่งคำขอใหม่แบบด่วน")
+        with st.form("user_quick_approval_form"):
+            qa_col1, qa_col2 = st.columns([1, 2])
+            with qa_col1:
+                qa_type = st.selectbox("ประเภทคำขอ", ["LEAVE", "EXPENSE", "PO"])
+                qa_amt = st.number_input(
+                    "จำนวนเงิน (บาท · ลางานใส่ 0)", min_value=0.0, value=0.0, step=100.0
+                )
+            with qa_col2:
+                qa_title = st.text_input(
+                    "รายละเอียดคำขอ", placeholder="เช่น ขอลากิจ 1 วัน / ขอเบิกค่าเดินทาง"
+                )
+            submit_qa = st.form_submit_button("ส่งคำขออนุมัติ", type="primary")
+        if submit_qa:
+            if not qa_title.strip():
+                st.error("กรุณาระบุรายละเอียดคำขอ")
+            else:
+                saved_qa = False
+                conn = get_db_connection()
+                try:
+                    conn.execute(
+                        """INSERT INTO approvals
+                           (doc_type, title, amount, requested_by, status)
+                           VALUES (?, ?, ?, ?, 'Pending Approval')""",
+                        (
+                            qa_type,
+                            qa_title.strip(),
+                            round(float(qa_amt), 2),
+                            current_user["full_name"],
+                        ),
+                    )
+                    conn.commit()
+                    saved_qa = True
+                except sqlite3.Error as error:
+                    safe_rollback(conn)
+                    st.error(f"ส่งคำขอไม่สำเร็จ: {error}")
+                finally:
+                    conn.close()
+
+                if saved_qa:
+                    log_audit_action(
+                        current_user["full_name"],
+                        f"ส่งคำขอจากหน้า User Portal: {qa_title.strip()}",
+                    )
+                    set_flash("success", "ส่งคำขออนุมัติเรียบร้อยแล้ว")
+                    st.rerun()
+
+        st.subheader("📋 รายการคำขอของฉัน")
+        if my_approvals_df.empty:
+            st.info("คุณยังไม่มีรายการคำขออนุมัติในระบบ")
+        else:
+            st.dataframe(my_approvals_df, use_container_width=True, hide_index=True)
+
+    with ut3:
+        st.subheader("📜 กิจกรรมล่าสุดของฉัน")
+        if my_logs_df.empty:
+            st.info("ยังไม่มีประวัติการใช้งาน")
+        else:
+            st.dataframe(my_logs_df, use_container_width=True, hide_index=True)
 
 # ------------------------------------------------------------------------------
 # MODULE 1: DASHBOARD OVERVIEW
 # ------------------------------------------------------------------------------
-if app_menu == "📊 Dashboard Overview":
+elif app_menu == "📊 Dashboard Overview":
     conn = get_db_connection()
     try:
         df_sales = pd.read_sql_query("SELECT * FROM sales", conn)
@@ -1655,9 +2072,10 @@ if app_menu == "📊 Dashboard Overview":
     m5.metric("รออนุมัติ", f"{pending_approvals_count} รายการ")
 
     if not df_prod.empty:
-        low_stock_df = df_prod[
-            df_prod["stock"].fillna(0) <= df_prod["min_stock"].fillna(10)
-        ]
+        df_prod_clean = df_prod.copy()
+        df_prod_clean["stock"] = df_prod_clean["stock"].fillna(0).astype(int)
+        df_prod_clean["min_stock"] = df_prod_clean["min_stock"].fillna(10).astype(int)
+        low_stock_df = df_prod_clean[df_prod_clean["stock"] <= df_prod_clean["min_stock"]]
         if not low_stock_df.empty:
             st.warning(
                 f"⚠️ พบสินค้าต่ำกว่าเกณฑ์ขั้นต่ำ {len(low_stock_df)} รายการ: "
@@ -1688,8 +2106,17 @@ if app_menu == "📊 Dashboard Overview":
     with c2:
         st.subheader("📊 สัดส่วนสถานะการชำระเงิน")
         if not df_sales.empty:
-            fig_p = px.pie(df_sales, names="status", values="total", hole=0.4)
-            st.plotly_chart(fig_p, use_container_width=True)
+            status_summary = (
+                df_sales.groupby("status", as_index=False)["total"].sum()
+            )
+            status_summary = status_summary[status_summary["total"] > 0]
+            if not status_summary.empty:
+                fig_p = px.pie(
+                    status_summary, names="status", values="total", hole=0.4
+                )
+                st.plotly_chart(fig_p, use_container_width=True)
+            else:
+                st.info("ยังไม่มีข้อมูลยอดชำระเงิน")
         else:
             st.info("ยังไม่มีข้อมูลสถานะการชำระเงิน")
 
@@ -1700,151 +2127,173 @@ elif app_menu == "🧾 e-Tax Invoice & Dynamic QR":
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("📝 ออกใบกำกับภาษีใหม่")
-        with st.form("etax_form"):
-            d_no = generated_text_input(
-                "เลขที่เอกสาร",
-                "etax_doc_no",
-                lambda: f"INV-{date.today():%Y%m%d}-{uuid.uuid4().hex[:8].upper()}",
-            )
-            cust = st.text_input("ชื่อลูกค้า / นิติบุคคล", "บริษัท สยามเทคโนโลยี จำกัด")
-            amt = st.number_input(
-                "มูลค่าสินค้า/บริการ (บาท)", min_value=0.01, value=10000.0, step=500.0
-            )
-            amt = round(float(amt), 2)
-            pay_method = st.selectbox(
-                "ช่องทางชำระเงิน",
-                ["โอนเงินผ่านธนาคาร", "PromptPay", "บัตรเครดิต", "เงินสด"],
-            )
+        d_no = generated_text_input(
+            "เลขที่เอกสาร",
+            "etax_doc_no",
+            lambda: f"INV-{date.today():%Y%m%d}-{uuid.uuid4().hex[:8].upper()}",
+        )
+        cust = st.text_input(
+            "ชื่อลูกค้า / นิติบุคคล",
+            value="บริษัท สยามเทคโนโลยี จำกัด",
+            key="etax_customer_name",
+        )
+        cust_tax_id = st.text_input(
+            "เลขประจำตัวผู้เสียภาษีลูกค้า (ไม่บังคับ)",
+            placeholder="เช่น 0105551234567",
+            key="etax_customer_tax_id",
+        )
+        amt = st.number_input(
+            "มูลค่าสินค้า/บริการ (บาท)",
+            min_value=0.01,
+            value=10000.0,
+            step=500.0,
+            key="etax_amount",
+        )
+        amt = round(float(amt), 2)
+        pay_method = st.selectbox(
+            "ช่องทางชำระเงิน",
+            ["โอนเงินผ่านธนาคาร", "PromptPay", "บัตรเครดิต", "เงินสด"],
+            key="etax_pay_method",
+        )
+        promptpay_id = ""
+        if pay_method == "PromptPay":
             promptpay_id = st.text_input(
-                "PromptPay เบอร์มือถือ/เลขผู้เสียภาษี (กรณีเลือก PromptPay)",
+                "PromptPay เบอร์มือถือ/เลขผู้เสียภาษี",
                 placeholder="เช่น 0812345678 หรือเลขประจำตัว 13 หลัก",
-                help="ระบุเลข PromptPay ของผู้รับเงินเพื่อสร้าง QR สำหรับเอกสารนี้",
+                help="ระบบจะสร้าง Dynamic PromptPay QR Code ด้านขวาให้อัตโนมัติ",
+                key="etax_promptpay_id",
             )
-            st_val = st.selectbox(
-                "สถานะ",
-                ["ชำระแล้ว", "รอชำระ"],
-                index=1,
-                help="เลือกชำระแล้วเฉพาะเมื่อได้รับเงินเรียบร้อย",
-            )
+        st_val = st.selectbox(
+            "สถานะ",
+            ["ชำระแล้ว", "รอชำระ"],
+            index=1,
+            help="เลือกชำระแล้วเฉพาะเมื่อได้รับเงินเรียบร้อย",
+            key="etax_status",
+        )
 
-            vat = round(amt * 0.07, 2)
-            tot = round(amt + vat, 2)
+        vat = round(amt * 0.07, 2)
+        tot = round(amt + vat, 2)
 
-            if st.form_submit_button("💾 บันทึกและออกใบกำกับภาษี", type="primary"):
-                valid_input = True
-                if not d_no.strip() or not cust.strip():
-                    st.error("กรุณาระบุเลขที่เอกสารและชื่อลูกค้า")
+        if st.button(
+            "💾 บันทึกและออกใบกำกับภาษี", type="primary", use_container_width=True
+        ):
+            valid_input = True
+            if not d_no.strip() or not cust.strip():
+                st.error("กรุณาระบุเลขที่เอกสารและชื่อลูกค้า")
+                valid_input = False
+            elif pay_method == "PromptPay":
+                if not promptpay_id.strip():
+                    st.error("กรุณาระบุเลข PromptPay เพื่อสร้าง QR")
                     valid_input = False
-                elif pay_method == "PromptPay":
-                    if not promptpay_id.strip():
-                        st.error("กรุณาระบุเลข PromptPay เพื่อสร้าง QR")
-                        valid_input = False
-                    else:
-                        try:
-                            generate_promptpay_payload(promptpay_id, tot)
-                        except ValueError as error:
-                            st.error(str(error))
-                            valid_input = False
-
-                if valid_input:
-                    saved_sale = False
-                    conn = get_db_connection()
+                else:
                     try:
-                        cursor = conn.cursor()
-                        cursor.execute("BEGIN IMMEDIATE")
+                        generate_promptpay_payload(promptpay_id, tot)
+                    except ValueError as error:
+                        st.error(str(error))
+                        valid_input = False
+
+            if valid_input:
+                saved_sale = False
+                conn = get_db_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute("BEGIN IMMEDIATE")
+                    cursor.execute(
+                        """INSERT INTO sales
+                           (doc_no, customer, customer_tax_id, amount, tax, total, status, payment_method)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            d_no.strip(),
+                            cust.strip(),
+                            cust_tax_id.strip() or None,
+                            amt,
+                            vat,
+                            tot,
+                            st_val,
+                            pay_method,
+                        ),
+                    )
+                    sale_id = cursor.lastrowid
+                    if st_val != "ชำระแล้ว":
+                        debit_code, debit_name = "11300", "ลูกหนี้การค้า"
+                    elif pay_method == "บัตรเครดิต":
+                        debit_code, debit_name = "11200", "เงินรับผ่านบัตร"
+                    else:
+                        debit_code, debit_name = "11100", "เงินสด/เงินฝากธนาคาร"
+
+                    if st_val == "ชำระแล้ว":
                         cursor.execute(
-                            """INSERT INTO sales
-                               (doc_no, customer, amount, tax, total, status, payment_method)
-                               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            """INSERT INTO sales_payments
+                               (sale_id, amount, payment_method, received_by)
+                               VALUES (?, ?, ?, ?)""",
                             (
-                                d_no.strip(),
-                                cust.strip(),
-                                amt,
-                                vat,
+                                sale_id,
                                 tot,
-                                st_val,
                                 pay_method,
+                                st.session_state.user["full_name"],
                             ),
                         )
-                        sale_id = cursor.lastrowid
-                        if st_val != "ชำระแล้ว":
-                            debit_code, debit_name = "11300", "ลูกหนี้การค้า"
-                        elif pay_method == "บัตรเครดิต":
-                            debit_code, debit_name = "11200", "เงินรับผ่านบัตร"
-                        else:
-                            debit_code, debit_name = "11100", "เงินสด/เงินฝากธนาคาร"
+                    journal_rows = [
+                        (
+                            date.today().isoformat(),
+                            debit_code,
+                            debit_name,
+                            tot,
+                            0.0,
+                            f"รับรู้ยอดขาย {d_no.strip()}",
+                        ),
+                        (
+                            date.today().isoformat(),
+                            "41100",
+                            "รายได้จากการขาย",
+                            0.0,
+                            amt,
+                            f"รับรู้ยอดขาย {d_no.strip()}",
+                        ),
+                        (
+                            date.today().isoformat(),
+                            "21300",
+                            "ภาษีขาย",
+                            0.0,
+                            vat,
+                            f"ภาษีขาย 7% {d_no.strip()}",
+                        ),
+                    ]
+                    cursor.executemany(
+                        """INSERT INTO journal_entries
+                           (entry_date, account_code, account_name, debit, credit, description)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        journal_rows,
+                    )
+                    conn.commit()
+                    saved_sale = True
+                except sqlite3.IntegrityError:
+                    safe_rollback(conn)
+                    st.error("เลขที่เอกสารนี้มีอยู่แล้ว")
+                except sqlite3.Error as error:
+                    safe_rollback(conn)
+                    st.error(f"บันทึกใบกำกับภาษีไม่สำเร็จ: {error}")
+                finally:
+                    conn.close()
 
-                        if st_val == "ชำระแล้ว":
-                            cursor.execute(
-                                """INSERT INTO sales_payments
-                                   (sale_id, amount, payment_method, received_by)
-                                   VALUES (?, ?, ?, ?)""",
-                                (
-                                    sale_id,
-                                    tot,
-                                    pay_method,
-                                    st.session_state.user["full_name"],
-                                ),
-                            )
-                        journal_rows = [
-                            (
-                                date.today().isoformat(),
-                                debit_code,
-                                debit_name,
-                                tot,
-                                0.0,
-                                f"รับรู้ยอดขาย {d_no.strip()}",
-                            ),
-                            (
-                                date.today().isoformat(),
-                                "41100",
-                                "รายได้จากการขาย",
-                                0.0,
-                                amt,
-                                f"รับรู้ยอดขาย {d_no.strip()}",
-                            ),
-                            (
-                                date.today().isoformat(),
-                                "21300",
-                                "ภาษีขาย",
-                                0.0,
-                                vat,
-                                f"ภาษีขาย 7% {d_no.strip()}",
-                            ),
-                        ]
-                        cursor.executemany(
-                            """INSERT INTO journal_entries
-                               (entry_date, account_code, account_name, debit, credit, description)
-                               VALUES (?, ?, ?, ?, ?, ?)""",
-                            journal_rows,
-                        )
-                        conn.commit()
-                        saved_sale = True
-                    except sqlite3.IntegrityError:
-                        safe_rollback(conn)
-                        st.error("เลขที่เอกสารนี้มีอยู่แล้ว")
-                    except sqlite3.Error as error:
-                        safe_rollback(conn)
-                        st.error(f"บันทึกใบกำกับภาษีไม่สำเร็จ: {error}")
-                    finally:
-                        conn.close()
-
-                    if saved_sale:
-                        log_audit_action(
-                            st.session_state.user["full_name"],
-                            f"ออกใบกำกับภาษี {d_no.strip()}",
-                        )
-                        queue_generated_text_input(
-                            "etax_doc_no",
-                            f"INV-{date.today():%Y%m%d}-{uuid.uuid4().hex[:8].upper()}",
-                        )
-                        st.success(f"บันทึกเอกสาร {d_no.strip()} เรียบร้อยแล้ว!")
-                        st.rerun()
+                if saved_sale:
+                    log_audit_action(
+                        st.session_state.user["full_name"],
+                        f"ออกใบกำกับภาษี {d_no.strip()}",
+                    )
+                    queue_generated_text_input(
+                        "etax_doc_no",
+                        f"INV-{date.today():%Y%m%d}-{uuid.uuid4().hex[:8].upper()}",
+                    )
+                    set_flash("success", f"บันทึกเอกสาร {d_no.strip()} เรียบร้อยแล้ว!")
+                    st.rerun()
 
     with c2:
-        st.subheader("🧾 ตัวอย่างเอกสาร Printable View")
+        st.subheader("🧾 ตัวอย่างเอกสาร (Live Preview)")
         safe_document_no = safe_text(d_no)
         safe_customer = safe_text(cust)
+        safe_tax_id = safe_text(cust_tax_id.strip() or "-")
+        safe_pay_method = safe_text(pay_method)
         st.markdown(
             f"""
         <div class="receipt-paper">
@@ -1853,6 +2302,9 @@ elif app_menu == "🧾 e-Tax Invoice & Dynamic QR":
             <hr>
             <p><b>เลขที่:</b> {safe_document_no}</p>
             <p><b>ลูกค้า:</b> {safe_customer}</p>
+            <p><b>เลขผู้เสียภาษี:</b> {safe_tax_id}</p>
+            <p><b>ช่องทางชำระ:</b> {safe_pay_method}</p>
+            <hr>
             <p><b>มูลค่าก่อน VAT:</b> ฿{amt:,.2f}</p>
             <p><b>ภาษี VAT 7%:</b> ฿{vat:,.2f}</p>
             <h4 style="color:#2563EB;">ยอดรวมสุทธิ: ฿{tot:,.2f}</h4>
@@ -1874,15 +2326,15 @@ elif app_menu == "🧾 e-Tax Invoice & Dynamic QR":
                     caption=f"สแกนชำระเงิน ฿{tot:,.2f}",
                     width=260,
                 )
-        else:
-            st.info("เลือกช่องทาง PromptPay และระบุเลขผู้รับเงินเพื่อสร้าง QR Code")
+        elif pay_method == "PromptPay":
+            st.info("กรอกเบอร์มือถือหรือเลขผู้เสียภาษีด้านซ้ายเพื่อสร้าง PromptPay QR Code ทันที")
 
     st.markdown("---")
     st.subheader("📋 รายการใบกำกับภาษีในระบบ")
     conn = get_db_connection()
     try:
         df_all_sales = pd.read_sql_query(
-            """SELECT doc_no, customer, amount, tax, total, status,
+            """SELECT doc_no, customer, customer_tax_id, amount, tax, total, status,
                       payment_method, created_at
                FROM sales ORDER BY id DESC""",
             conn,
@@ -1940,8 +2392,9 @@ elif app_menu == "🧾 e-Tax Invoice & Dynamic QR":
             receive_amount = st.number_input(
                 f"ยอดรับชำระ (ยอดคงค้าง ฿{due_amount:,.2f})",
                 min_value=0.01,
+                max_value=due_amount,
                 value=due_amount,
-                key=f"receive_amount_{selected_sale['id']}",
+                key=f"receive_amount_{selected_sale['id']}_{due_amount:.2f}",
             )
             receive_payment = st.form_submit_button("บันทึกรับชำระ", type="primary")
         if receive_payment:
@@ -1959,7 +2412,7 @@ elif app_menu == "🧾 e-Tax Invoice & Dynamic QR":
                     st.session_state.user["full_name"],
                     f"รับชำระ {selected_sale['doc_no']} ฿{receive_amount:,.2f}",
                 )
-                st.success(f"รับชำระแล้ว · ยอดคงค้าง ฿{remaining:,.2f}")
+                set_flash("success", f"รับชำระแล้ว · ยอดคงค้าง ฿{remaining:,.2f}")
                 st.rerun()
 
 # ------------------------------------------------------------------------------
@@ -2028,7 +2481,7 @@ elif app_menu == "🤝 ระบบลูกค้าสัมพันธ์ (C
                                 "crm_customer_code",
                                 f"CUST-{uuid.uuid4().hex[:8].upper()}",
                             )
-                            st.success("บันทึกข้อมูลลูกค้าเรียบร้อยแล้ว!")
+                            set_flash("success", "บันทึกข้อมูลลูกค้าเรียบร้อยแล้ว!")
                             st.rerun()
 
     conn = get_db_connection()
@@ -2041,9 +2494,14 @@ elif app_menu == "🤝 ระบบลูกค้าสัมพันธ์ (C
 
     with c2:
         if not df_crm.empty:
+            tier_counts = (
+                df_crm["tier"].fillna("Silver").value_counts().reset_index()
+            )
+            tier_counts.columns = ["tier", "count"]
             fig_crm = px.pie(
-                df_crm,
+                tier_counts,
                 names="tier",
+                values="count",
                 title="สัดส่วนระดับสมาชิกลูกค้า (CRM Tier)",
                 hole=0.35,
             )
@@ -2207,7 +2665,10 @@ elif app_menu == "🛍️ จัดซื้อและคู่ค้า (Purc
                             "purchase_order_number",
                             f"PO-{date.today():%Y%m%d}-{uuid.uuid4().hex[:8].upper()}",
                         )
-                        st.success(f"บันทึกใบสั่งซื้อ {po_num.strip()} และส่งขออนุมัติแล้ว!")
+                        set_flash(
+                            "success",
+                            f"บันทึกใบสั่งซื้อ {po_num.strip()} และส่งขออนุมัติแล้ว!",
+                        )
                         st.rerun()
 
     conn = get_db_connection()
@@ -2294,7 +2755,10 @@ elif app_menu == "💸 คุมงบประมาณและค่าใช
                             "expense_number",
                             f"EXP-{date.today():%Y%m%d}-{uuid.uuid4().hex[:8].upper()}",
                         )
-                        st.success(f"บันทึกค่าใช้จ่าย {e_num.strip()} และส่งขออนุมัติเรียบร้อย!")
+                        set_flash(
+                            "success",
+                            f"บันทึกค่าใช้จ่าย {e_num.strip()} และส่งขออนุมัติเรียบร้อย!",
+                        )
                         st.rerun()
 
     conn = get_db_connection()
@@ -2305,14 +2769,21 @@ elif app_menu == "💸 คุมงบประมาณและค่าใช
 
     with c2:
         if not df_exp.empty:
-            fig_exp = px.pie(
-                df_exp,
-                names="category",
-                values="amount",
-                title="สัดส่วนค่าใช้จ่ายตามหมวดหมู่",
-                hole=0.35,
+            exp_summary = (
+                df_exp.groupby("category", as_index=False)["amount"].sum()
             )
-            st.plotly_chart(fig_exp, use_container_width=True)
+            exp_summary = exp_summary[exp_summary["amount"] > 0]
+            if not exp_summary.empty:
+                fig_exp = px.pie(
+                    exp_summary,
+                    names="category",
+                    values="amount",
+                    title="สัดส่วนค่าใช้จ่ายตามหมวดหมู่",
+                    hole=0.35,
+                )
+                st.plotly_chart(fig_exp, use_container_width=True)
+            else:
+                st.info("ยังไม่มีข้อมูลยอดค่าใช้จ่าย")
         else:
             st.info("ยังไม่มีข้อมูลค่าใช้จ่ายในระบบ")
 
@@ -2398,7 +2869,7 @@ elif app_menu == "📦 Smart Inventory WMS":
                         queue_generated_text_input(
                             "product_sku", f"SKU-{uuid.uuid4().hex[:8].upper()}"
                         )
-                        st.success("เพิ่มสินค้าเรียบร้อยแล้ว!")
+                        set_flash("success", "เพิ่มสินค้าเรียบร้อยแล้ว!")
                         st.rerun()
 
     conn = get_db_connection()
@@ -2408,7 +2879,9 @@ elif app_menu == "📦 Smart Inventory WMS":
         conn.close()
 
     if not df_prod.empty:
-        low_df = df_prod[df_prod["stock"].fillna(0) <= df_prod["min_stock"].fillna(10)]
+        df_prod["stock"] = df_prod["stock"].fillna(0).astype(int)
+        df_prod["min_stock"] = df_prod["min_stock"].fillna(10).astype(int)
+        low_df = df_prod[df_prod["stock"] <= df_prod["min_stock"]]
         if not low_df.empty:
             st.warning(f"⚠️ มีสินค้าใกล้หมด {len(low_df)} รายการ กรุณาตรวจสอบและสั่งซื้อเพิ่ม")
 
@@ -2448,7 +2921,7 @@ elif app_menu == "📦 Smart Inventory WMS":
                     st.session_state.user["full_name"],
                     f"ปรับสต็อก {selected_product_label} เป็น {updated_stock} ชิ้น",
                 )
-                st.success(f"บันทึกแล้ว · คงเหลือ {updated_stock} ชิ้น")
+                set_flash("success", f"บันทึกแล้ว · คงเหลือ {updated_stock} ชิ้น")
                 st.rerun()
 
     conn = get_db_connection()
@@ -2528,7 +3001,7 @@ elif app_menu == "👥 HR & Payroll":
                         queue_generated_text_input(
                             "employee_code", f"EMP-{uuid.uuid4().hex[:8].upper()}"
                         )
-                        st.success("เพิ่มข้อมูลพนักงานเรียบร้อยแล้ว!")
+                        set_flash("success", "เพิ่มข้อมูลพนักงานเรียบร้อยแล้ว!")
                         st.rerun()
 
     conn = get_db_connection()
@@ -2561,7 +3034,7 @@ elif app_menu == "👥 HR & Payroll":
                 st.session_state.user["full_name"],
                 f"สร้างรอบเงินเดือน {payroll_period.strip()}",
             )
-            st.success(f"สร้างรอบเงินเดือนแล้วสำหรับพนักงาน {employee_count} คน")
+            set_flash("success", f"สร้างรอบเงินเดือนแล้วสำหรับพนักงาน {employee_count} คน")
             st.rerun()
 
     conn = get_db_connection()
@@ -2574,12 +3047,14 @@ elif app_menu == "👥 HR & Payroll":
 
     if payroll_runs:
         run_options = {
-            f"{row['period']} · {row['status']}": row["id"] for row in payroll_runs
+            f"{row['period']} · {row['status']}": row for row in payroll_runs
         }
         selected_run_label = st.selectbox(
             "เลือกรอบเงินเดือน", list(run_options), key="selected_payroll_run"
         )
-        selected_run_id = run_options[selected_run_label]
+        selected_run = run_options[selected_run_label]
+        selected_run_id = selected_run["id"]
+        selected_run_status = selected_run["status"]
 
         conn = get_db_connection()
         try:
@@ -2595,24 +3070,27 @@ elif app_menu == "👥 HR & Payroll":
         finally:
             conn.close()
 
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "รหัสพนักงาน": row["emp_code"],
-                        "ชื่อ": row["name"],
-                        "เงินเดือน": row["gross_pay"],
-                        "รายการหัก": row["deductions"],
-                        "เงินสุทธิ": row["net_pay"],
-                    }
-                    for row in payroll_items
-                ]
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+        if payroll_items:
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "รหัสพนักงาน": row["emp_code"],
+                            "ชื่อ": row["name"],
+                            "เงินเดือน": row["gross_pay"],
+                            "รายการหัก": row["deductions"],
+                            "เงินสุทธิ": row["net_pay"],
+                        }
+                        for row in payroll_items
+                    ]
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("ไม่มีรายการพนักงานในรอบเงินเดือนนี้")
 
-        if selected_run_label.endswith("· Draft") and payroll_items:
+        if selected_run_status == "Draft" and payroll_items:
             employee_options = {
                 f"{row['emp_code']} · {row['name']}": row for row in payroll_items
             }
@@ -2626,15 +3104,20 @@ elif app_menu == "👥 HR & Payroll":
             current_ded = min(float(selected_employee["deductions"]), gross_val)
 
             with st.form("save_payroll_deduction_form"):
+                ded_kwargs = {
+                    "min_value": 0.0,
+                    "value": current_ded,
+                    "step": 100.0,
+                    "key": (
+                        f"payroll_deduction_{selected_run_id}_"
+                        f"{selected_employee['employee_id']}_{current_ded:.2f}"
+                    ),
+                }
+                if gross_val > 0:
+                    ded_kwargs["max_value"] = gross_val
                 deduction = st.number_input(
                     f"ยอดหัก (ประกันสังคม / ภาษี / อื่นๆ · สูงสุด ฿{gross_val:,.2f})",
-                    min_value=0.0,
-                    value=current_ded,
-                    step=100.0,
-                    key=(
-                        f"payroll_deduction_{selected_run_id}_"
-                        f"{selected_employee['employee_id']}"
-                    ),
+                    **ded_kwargs,
                 )
                 save_deduction = st.form_submit_button("บันทึกยอดหัก")
             if save_deduction:
@@ -2651,7 +3134,7 @@ elif app_menu == "👥 HR & Payroll":
                         st.session_state.user["full_name"],
                         f"บันทึกยอดหักรอบเงินเดือน {selected_run_label}",
                     )
-                    st.success("บันทึกยอดหักแล้ว")
+                    set_flash("success", "บันทึกยอดหักเรียบร้อยแล้ว")
                     st.rerun()
 
             if st.button(
@@ -2668,7 +3151,7 @@ elif app_menu == "👥 HR & Payroll":
                         st.session_state.user["full_name"],
                         f"จ่ายเงินเดือนรอบ {selected_run_label} ฿{net_pay:,.2f}",
                     )
-                    st.success("จ่ายเงินเดือนและบันทึกบัญชีเรียบร้อยแล้ว")
+                    set_flash("success", "จ่ายเงินเดือนและบันทึกบัญชีเรียบร้อยแล้ว")
                     st.rerun()
 
 # ------------------------------------------------------------------------------
@@ -2757,7 +3240,10 @@ elif app_menu == "📒 บันทึกบัญชีและงบการ
                             st.session_state.user["full_name"],
                             f"บันทึกสมุดรายวัน {j_date} จำนวน ฿{j_amount:,.2f}",
                         )
-                        st.success("บันทึกรายการเดบิตและเครดิตที่สมดุลเรียบร้อยแล้ว!")
+                        set_flash(
+                            "success",
+                            "บันทึกรายการเดบิตและเครดิตที่สมดุลเรียบร้อยแล้ว!",
+                        )
                         st.rerun()
 
         st.dataframe(df_j, use_container_width=True, hide_index=True)
@@ -2800,7 +3286,7 @@ elif app_menu == "📒 บันทึกบัญชีและงบการ
         if df_j.empty:
             st.info("ยังไม่มีรายการบัญชีสำหรับสรุปงบกำไรขาดทุน")
         else:
-            codes = df_j["account_code"].fillna("").astype(str)
+            codes = df_j["account_code"].fillna("").astype(str).str.strip()
             rev_df = df_j[codes.str.startswith("4")]
             exp_df = df_j[codes.str.startswith(("5", "6"))]
             total_revenue = float(
@@ -2842,7 +3328,10 @@ elif app_menu == "🛡️ ระบบขออนุมัติ (E-Approval)":
         a_type = st.selectbox("ประเภทเอกสาร", ["PO", "EXPENSE", "LEAVE"])
         a_title = st.text_input("เรื่องที่ขออนุมัติ")
         a_amt = st.number_input(
-            "จำนวนเงินงบประมาณ (บาท)", min_value=0.01, value=5000.0
+            "จำนวนเงินงบประมาณ (บาท · กรณีลางานใส่ 0 ได้)",
+            min_value=0.0,
+            value=0.0,
+            step=500.0,
         )
 
         if st.form_submit_button("ส่งคำขออนุมัติ", type="primary"):
@@ -2876,7 +3365,7 @@ elif app_menu == "🛡️ ระบบขออนุมัติ (E-Approval)":
                         st.session_state.user["full_name"],
                         f"ส่งคำขออนุมัติ: {a_title.strip()}",
                     )
-                    st.success("ส่งคำขออนุมัติเรียบร้อยแล้ว!")
+                    set_flash("success", "ส่งคำขออนุมัติเรียบร้อยแล้ว!")
                     st.rerun()
 
     conn = get_db_connection()
@@ -2891,56 +3380,56 @@ elif app_menu == "🛡️ ระบบขออนุมัติ (E-Approval)":
     finally:
         conn.close()
 
-    if pending_approvals:
-        approval_options = {
-            f"#{row['id']} · {row['doc_type']} · {row['title']} · "
-            f"฿{float(row['amount']):,.2f} · {row['requested_by']}": row["id"]
-            for row in pending_approvals
-        }
-        st.subheader("⚖️ พิจารณาคำขอที่รออนุมัติ")
-        with st.form("review_approval_form"):
-            selected_approval = st.selectbox(
-                "เลือกคำขอที่รอดำเนินการ", list(approval_options)
-            )
-            decision = st.radio(
-                "ผลการพิจารณา", ["อนุมัติ", "ปฏิเสธ"], horizontal=True
-            )
-            review_approval = st.form_submit_button(
-                "บันทึกผลการพิจารณา", type="primary"
-            )
-        if review_approval:
-            target_status = "Approved" if decision == "อนุมัติ" else "Rejected"
-            try:
-                transition_approval(
-                    approval_options[selected_approval],
-                    target_status,
-                    st.session_state.user["full_name"],
+    if user_role in APPROVER_ROLES:
+        if pending_approvals:
+            approval_options = {
+                f"#{row['id']} · {row['doc_type']} · {row['title']} · "
+                f"฿{float(row['amount']):,.2f} · {row['requested_by']}": row["id"]
+                for row in pending_approvals
+            }
+            st.subheader("⚖️ พิจารณาคำขอที่รออนุมัติ")
+            with st.form("review_approval_form"):
+                selected_approval = st.selectbox(
+                    "เลือกคำขอที่รอดำเนินการ", list(approval_options)
                 )
-            except (ValueError, sqlite3.Error) as error:
-                st.error(str(error))
-            else:
-                log_audit_action(
-                    st.session_state.user["full_name"],
-                    f"{decision}คำขอ {selected_approval}",
+                decision = st.radio(
+                    "ผลการพิจารณา", ["อนุมัติ", "ปฏิเสธ"], horizontal=True
                 )
-                st.success("บันทึกผลการพิจารณาเรียบร้อยแล้ว")
-                st.rerun()
+                review_approval = st.form_submit_button(
+                    "บันทึกผลการพิจารณา", type="primary"
+                )
+            if review_approval:
+                target_status = "Approved" if decision == "อนุมัติ" else "Rejected"
+                try:
+                    transition_approval(
+                        approval_options[selected_approval],
+                        target_status,
+                        st.session_state.user["full_name"],
+                    )
+                except (ValueError, sqlite3.Error) as error:
+                    st.error(str(error))
+                else:
+                    log_audit_action(
+                        st.session_state.user["full_name"],
+                        f"{decision}คำขอ {selected_approval}",
+                    )
+                    set_flash("success", "บันทึกผลการพิจารณาเรียบร้อยแล้ว")
+                    st.rerun()
+        else:
+            st.info("ไม่มีคำขอที่รอการพิจารณา")
     else:
-        st.info("ไม่มีคำขอที่รอการพิจารณา")
+        st.info("คุณสามารถส่งคำขอและติดตามสถานะได้ (สิทธิ์อนุมัติสงวนไว้สำหรับ Admin / ผู้บริหาร)")
 
     st.dataframe(df_app, use_container_width=True, hide_index=True)
 
 # ------------------------------------------------------------------------------
-# MODULE 11: ADMIN SETTINGS & AUDIT LOGS
+# MODULE 11: ADMIN CENTER (หน้าผู้ดูแลระบบ)
 # ------------------------------------------------------------------------------
-elif app_menu == "⚙️ Admin Settings & Audit Logs":
-    st.subheader("⚙️ ผู้ใช้งานในระบบและ Audit Trail")
-    a1, a2 = st.tabs(["👥 ผู้ใช้งานทั้งหมด", "📜 Audit Logs"])
-
+elif app_menu == "🛡️ หน้าผู้ดูแลระบบ (Admin Center)":
     conn = get_db_connection()
     try:
         df_u = pd.read_sql_query(
-            """SELECT id, username, full_name, role, department, email, status
+            """SELECT id, username, full_name, role, department, email, status, created_at
                FROM users ORDER BY id""",
             conn,
         )
@@ -2951,21 +3440,45 @@ elif app_menu == "⚙️ Admin Settings & Audit Logs":
         df_log = pd.read_sql_query(
             "SELECT * FROM audit_logs ORDER BY id DESC LIMIT 2000", conn
         )
+        pending_count = conn.execute(
+            "SELECT COUNT(*) FROM approvals WHERE status = 'Pending Approval'"
+        ).fetchone()[0]
     finally:
         conn.close()
 
+    total_users = len(df_u)
+    admin_count = (
+        int(df_u["role"].isin(["Admin", "Super Admin"]).sum())
+        if not df_u.empty
+        else 0
+    )
+    normal_user_count = total_users - admin_count
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("บัญชีทั้งหมด", f"{total_users} บัญชี")
+    k2.metric("ผู้ดูแลระบบ (Admin)", f"{admin_count} บัญชี")
+    k3.metric("ผู้ใช้งานทั่วไป (User/อื่น ๆ)", f"{normal_user_count} บัญชี")
+    k4.metric("คำขอรออนุมัติ", f"{pending_count} รายการ")
+
+    st.markdown("---")
+    a1, a2 = st.tabs(["👥 จัดการบัญชี Admin & User", "📜 Audit Logs"])
+
     with a1:
-        with st.expander("➕ ลงทะเบียนผู้ใช้งานใหม่", expanded=False):
+        with st.expander("➕ สร้างบัญชี Admin / User ใหม่", expanded=False):
             with st.form("admin_create_user_form"):
-                new_username = st.text_input("ชื่อผู้ใช้", key="admin_new_username")
+                new_username = st.text_input("ชื่อผู้ใช้ (Username)", key="admin_new_username")
                 new_full_name = st.text_input(
                     "ชื่อ-นามสกุล", key="admin_new_full_name"
                 )
                 new_email = st.text_input("อีเมล", key="admin_new_email")
-                new_department = st.text_input("แผนก", key="admin_new_department")
+                new_department = st.text_input(
+                    "แผนก", value="ทั่วไป", key="admin_new_department"
+                )
                 new_role = st.selectbox(
-                    "บทบาท",
-                    ["POS", "Accounting", "HR", "Executive", "Admin"],
+                    "บทบาท (Role)",
+                    REGISTER_ROLES,
+                    index=1,
+                    format_func=format_role_label,
                     key="admin_new_role",
                 )
                 new_status = st.selectbox(
@@ -3039,17 +3552,18 @@ elif app_menu == "⚙️ Admin Settings & Audit Logs":
                             current_user["full_name"],
                             f"ลงทะเบียนผู้ใช้ {new_username.strip()} ({new_role}/{new_status})",
                         )
-                        st.success(
-                            f"ลงทะเบียนผู้ใช้ {new_username.strip()} เรียบร้อยแล้ว"
+                        set_flash(
+                            "success",
+                            f"ลงทะเบียนผู้ใช้ {new_username.strip()} เรียบร้อยแล้ว",
                         )
                         st.rerun()
 
-        st.subheader("👥 บัญชีผู้ใช้งานทั้งหมด")
+        st.subheader("👥 บัญชีผู้ใช้งานทั้งหมดในระบบ")
         st.dataframe(df_u, use_container_width=True, hide_index=True)
 
         if user_rows:
             user_options = {
-                f"{row['username']} · {row['full_name']} · {row['status']}": row
+                f"{row['username']} · {row['full_name']} · {row['role']} · {row['status']}": row
                 for row in user_rows
             }
             selected_user_label = st.selectbox(
@@ -3058,19 +3572,19 @@ elif app_menu == "⚙️ Admin Settings & Audit Logs":
                 key="admin_user_choice",
             )
             target_user = user_options[selected_user_label]
-            role_options = ["Admin", "Executive", "Accounting", "POS", "HR"]
             status_options = ["Active", "Pending", "Inactive"]
             is_self = int(target_user["id"]) == int(current_user["id"])
 
             with st.form("admin_user_update_form"):
                 edit_role = st.selectbox(
                     "บทบาท",
-                    role_options,
+                    ADMIN_EDIT_ROLES,
                     index=(
-                        role_options.index(target_user["role"])
-                        if target_user["role"] in role_options
-                        else 0
+                        ADMIN_EDIT_ROLES.index(target_user["role"])
+                        if target_user["role"] in ADMIN_EDIT_ROLES
+                        else 2
                     ),
+                    format_func=format_role_label,
                     disabled=is_self,
                     key=f"admin_edit_role_{target_user['id']}",
                 )
@@ -3107,16 +3621,23 @@ elif app_menu == "⚙️ Admin Settings & Audit Logs":
                         ).fetchone()
                         if not latest_user:
                             raise ValueError("ไม่พบบัญชีผู้ใช้นี้แล้ว")
+
+                        final_role = latest_user["role"] if is_self else edit_role
+                        final_status = latest_user["status"] if is_self else edit_status
+
                         removing_active_admin = (
-                            latest_user["role"] in ("Admin", "Super Admin")
-                            and latest_user["status"] == "Active"
-                            and (edit_role != "Admin" or edit_status != "Active")
+                            latest_user["role"] in ADMIN_ROLES
+                            and str(latest_user["status"]).strip().casefold() == "active"
+                            and (
+                                final_role not in ADMIN_ROLES
+                                or final_status != "Active"
+                            )
                         )
                         if removing_active_admin:
                             active_admin_count = admin_cursor.execute(
                                 """SELECT COUNT(*) FROM users
                                    WHERE role IN ('Admin', 'Super Admin')
-                                     AND status = 'Active'"""
+                                     AND LOWER(TRIM(status)) = 'active'"""
                             ).fetchone()[0]
                             if active_admin_count <= 1:
                                 raise ValueError(
@@ -3127,8 +3648,8 @@ elif app_menu == "⚙️ Admin Settings & Audit Logs":
                                 """UPDATE users SET role = ?, status = ?, password_hash = ?
                                    WHERE id = ?""",
                                 (
-                                    edit_role,
-                                    edit_status,
+                                    final_role,
+                                    final_status,
                                     hash_password(reset_password),
                                     target_user["id"],
                                 ),
@@ -3136,7 +3657,7 @@ elif app_menu == "⚙️ Admin Settings & Audit Logs":
                         else:
                             admin_cursor.execute(
                                 "UPDATE users SET role = ?, status = ? WHERE id = ?",
-                                (edit_role, edit_status, target_user["id"]),
+                                (final_role, final_status, target_user["id"]),
                             )
                         admin_conn.commit()
                         updated_ok = True
@@ -3149,9 +3670,9 @@ elif app_menu == "⚙️ Admin Settings & Audit Logs":
                     if updated_ok:
                         log_audit_action(
                             current_user["full_name"],
-                            f"ปรับบัญชี {target_user['username']} เป็น {edit_role}/{edit_status}",
+                            f"ปรับบัญชี {target_user['username']} เป็น {final_role}/{final_status}",
                         )
-                        st.success("บันทึกบัญชีผู้ใช้แล้ว")
+                        set_flash("success", "บันทึกบัญชีผู้ใช้เรียบร้อยแล้ว")
                         st.rerun()
 
     with a2:
@@ -3165,7 +3686,7 @@ elif app_menu == "⚙️ Admin Settings & Audit Logs":
             )
 
 # ------------------------------------------------------------------------------
-# MODULE 12: RESET / DELETE DATA MANAGER (FULL + PARTIAL + SINGLE ITEM)
+# MODULE 12: RESET / DELETE DATA MANAGER (ADMIN ONLY)
 # ------------------------------------------------------------------------------
 elif app_menu == "🗑️ ล้างข้อมูลระบบ (Reset Data)":
     st.subheader("🗑️ ศูนย์จัดการและลบข้อมูลในระบบทั้งหมด")
@@ -3233,8 +3754,9 @@ elif app_menu == "🗑️ ล้างข้อมูลระบบ (Reset Data
                     except (ValueError, sqlite3.Error) as error:
                         st.error(f"ล้างข้อมูลไม่สำเร็จ: {error}")
                     else:
-                        st.success(
-                            f"ล้างข้อมูลธุรกรรมทั้งหมดเรียบร้อยแล้ว ({deleted_rows:,} รายการ)"
+                        set_flash(
+                            "success",
+                            f"ล้างข้อมูลธุรกรรมทั้งหมดเรียบร้อยแล้ว ({deleted_rows:,} รายการ)",
                         )
                         st.rerun()
 
@@ -3266,6 +3788,7 @@ elif app_menu == "🗑️ ล้างข้อมูลระบบ (Reset Data
                         st.session_state.clear()
                         st.session_state.authenticated = False
                         st.session_state.user = None
+                        set_flash("success", "ล้างข้อมูลทั้งหมด (Factory Reset) เรียบร้อยแล้ว")
                         st.rerun()
 
     with tab_partial:
@@ -3297,8 +3820,9 @@ elif app_menu == "🗑️ ล้างข้อมูลระบบ (Reset Data
                 except (ValueError, sqlite3.Error) as error:
                     st.error(f"ลบข้อมูลไม่สำเร็จ: {error}")
                 else:
-                    st.success(
-                        f"ลบข้อมูลเรียบร้อยแล้ว ({deleted_rows:,} รายการ จาก {len(cleared_tables)} ตาราง)"
+                    set_flash(
+                        "success",
+                        f"ลบข้อมูลเรียบร้อยแล้ว ({deleted_rows:,} รายการ จาก {len(cleared_tables)} ตาราง)",
                     )
                     st.rerun()
 
@@ -3307,38 +3831,47 @@ elif app_menu == "🗑️ ล้างข้อมูลระบบ (Reset Data
             "🧾 ใบกำกับภาษี (Sales)": (
                 "sales",
                 "SELECT id, doc_no || ' · ' || customer || ' · ฿' || printf('%.2f', total) AS label FROM sales ORDER BY id DESC",
+                (),
             ),
             "📦 สินค้า (Products)": (
                 "products",
                 "SELECT id, sku || ' · ' || name || ' · คงเหลือ ' || stock AS label FROM products ORDER BY id DESC",
+                (),
             ),
             "🤝 ลูกค้า (CRM)": (
                 "crm_customers",
                 "SELECT id, cust_code || ' · ' || name || ' · ' || tier AS label FROM crm_customers ORDER BY id DESC",
+                (),
             ),
             "🛍️ ใบสั่งซื้อ (Purchase Orders)": (
                 "purchase_orders",
                 "SELECT id, po_no || ' · ' || vendor_name || ' · ' || item_name AS label FROM purchase_orders ORDER BY id DESC",
+                (),
             ),
             "💸 ค่าใช้จ่าย (Expenses)": (
                 "expenses",
                 "SELECT id, exp_no || ' · ' || category || ' · ' || description AS label FROM expenses ORDER BY id DESC",
+                (),
             ),
             "👥 พนักงาน (Employees)": (
                 "employees",
                 "SELECT id, emp_code || ' · ' || name || ' · ' || position AS label FROM employees ORDER BY id DESC",
+                (),
             ),
             "📒 สมุดรายวัน (Journal)": (
                 "journal_entries",
                 "SELECT id, entry_date || ' · ' || account_code || ' ' || account_name || ' · ' || COALESCE(description, '') AS label FROM journal_entries ORDER BY id DESC",
+                (),
             ),
             "🛡️ คำขออนุมัติ (Approvals)": (
                 "approvals",
                 "SELECT id, doc_type || ' · ' || title || ' · ' || status AS label FROM approvals ORDER BY id DESC",
+                (),
             ),
             "👤 บัญชีผู้ใช้งานอื่น (Users)": (
                 "users",
-                f"SELECT id, username || ' · ' || full_name || ' · ' || role AS label FROM users WHERE id != {int(current_user['id'])} ORDER BY id DESC",
+                "SELECT id, username || ' · ' || full_name || ' · ' || role AS label FROM users WHERE id != ? ORDER BY id DESC",
+                (int(current_user["id"]),),
             ),
         }
 
@@ -3347,11 +3880,11 @@ elif app_menu == "🗑️ ล้างข้อมูลระบบ (Reset Data
             list(single_delete_config.keys()),
             key="single_delete_category",
         )
-        table_key, query_sql = single_delete_config[chosen_category]
+        table_key, query_sql, query_params = single_delete_config[chosen_category]
 
         conn = get_db_connection()
         try:
-            item_rows = conn.execute(query_sql).fetchall()
+            item_rows = conn.execute(query_sql, query_params).fetchall()
         finally:
             conn.close()
 
@@ -3367,15 +3900,18 @@ elif app_menu == "🗑️ ล้างข้อมูลระบบ (Reset Data
                 list(item_map.keys()),
                 key=f"single_delete_item_{table_key}",
             )
-            if st.button("🗑️ ลบรายการนี้ถาวร", type="primary", key="confirm_single_del"):
+            if st.button(
+                "🗑️ ลบรายการนี้ถาวร", type="primary", key="confirm_single_del"
+            ):
                 try:
                     delete_single_record(
                         table_key,
                         item_map[selected_item_label],
                         st.session_state.user["full_name"],
+                        current_user_id=int(current_user["id"]),
                     )
                 except (ValueError, sqlite3.Error) as error:
                     st.error(f"ลบรายการไม่สำเร็จ: {error}")
                 else:
-                    st.success(f"ลบรายการ {selected_item_label} เรียบร้อยแล้ว")
+                    set_flash("success", f"ลบรายการ {selected_item_label} เรียบร้อยแล้ว")
                     st.rerun()
