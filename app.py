@@ -1,5 +1,5 @@
 # ==============================================================================
-# 🏛️ TaxMate Enterprise ERP Suite v7.0 (All-in-One Single-File Edition)
+# 🏛️ TaxMate Enterprise ERP Suite v7.3 (All-in-One + Audit Log & User Delete)
 # ==============================================================================
 
 import hashlib
@@ -28,7 +28,7 @@ except ImportError:
 # 1. PAGE CONFIG & THEME
 # ------------------------------------------------------------------------------
 st.set_page_config(
-    page_title="TaxMate Enterprise ERP Suite v7.0",
+    page_title="TaxMate Enterprise ERP Suite v7.3",
     page_icon="🏛️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -144,8 +144,30 @@ ALLOWED_RESET_TABLES = set(ALL_TX_TABLES) | {"users"}
 
 
 # ------------------------------------------------------------------------------
-# 3. HELPER & SECURITY FUNCTIONS
+# 3. UI COMPATIBILITY, HELPER & SECURITY FUNCTIONS
 # ------------------------------------------------------------------------------
+def ui_dataframe(df, **kwargs):
+    try:
+        return st.dataframe(df, width="stretch", **kwargs)
+    except TypeError:
+        return st.dataframe(df, use_container_width=True, **kwargs)
+
+
+def ui_plotly(fig, **kwargs):
+    try:
+        return st.plotly_chart(fig, width="stretch", **kwargs)
+    except TypeError:
+        return st.plotly_chart(fig, use_container_width=True, **kwargs)
+
+
+def ui_button(label, container=None, **kwargs):
+    target = container if container is not None else st
+    try:
+        return target.button(label, width="stretch", **kwargs)
+    except TypeError:
+        return target.button(label, use_container_width=True, **kwargs)
+
+
 def role_label(code: str) -> str:
     return ROLE_LABELS.get(code, str(code))
 
@@ -189,10 +211,34 @@ def table_exists(cur, name: str) -> bool:
     ).fetchone() is not None
 
 
+def table_columns(cur, table: str) -> set:
+    return {r["name"] for r in cur.execute(f'PRAGMA table_info("{table}")')}
+
+
 def ensure_col(cur, table: str, col: str, decl: str):
-    cols = {r["name"] for r in cur.execute(f'PRAGMA table_info("{table}")')}
-    if col not in cols:
+    if col not in table_columns(cur, table):
         cur.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {decl}')
+
+
+def archive_if_incompatible(cur, table: str, required_cols: set):
+    if not table_exists(cur, table):
+        return None
+    if required_cols.issubset(table_columns(cur, table)):
+        return None
+    suffix = 1
+    while True:
+        archive_name = f"{table}_legacy_v{suffix}"
+        if not table_exists(cur, archive_name):
+            break
+        suffix += 1
+    cur.execute(f'ALTER TABLE "{table}" RENAME TO "{archive_name}"')
+    return archive_name
+
+
+def username_exists(cur, username: str) -> bool:
+    return cur.execute(
+        "SELECT 1 FROM users WHERE LOWER(username) = LOWER(?)", (username.strip(),)
+    ).fetchone() is not None
 
 
 def hash_password(pw: str) -> str:
@@ -267,7 +313,7 @@ def qr_png_bytes(payload: str) -> bytes:
 
 
 # ------------------------------------------------------------------------------
-# 4. DATABASE INITIALIZATION & DOMAIN TRANSACTIONS
+# 4. DATABASE INITIALIZATION, AUTO-MIGRATION & DOMAIN TRANSACTIONS
 # ------------------------------------------------------------------------------
 def init_db():
     conn = get_conn()
@@ -278,6 +324,7 @@ def init_db():
             pass
         cur = conn.cursor()
 
+        # 1. Users
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -295,8 +342,10 @@ def init_db():
         ensure_col(cur, "users", "email", "TEXT")
         ensure_col(cur, "users", "status", "TEXT NOT NULL DEFAULT 'Active'")
         ensure_col(cur, "users", "allowed_modules", "TEXT NOT NULL DEFAULT 'all'")
+        ensure_col(cur, "users", "created_at", "TIMESTAMP")
         cur.execute("UPDATE users SET status = 'Active' WHERE status IS NULL OR TRIM(status) = ''")
 
+        # 2. Sales & Payments
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sales (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -317,6 +366,7 @@ def init_db():
         ensure_col(cur, "sales", "created_at", "TIMESTAMP")
         cur.execute("UPDATE sales SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL")
 
+        archive_if_incompatible(cur, "sales_payments", {"sale_id", "amount", "payment_method", "received_by"})
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sales_payments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -326,7 +376,9 @@ def init_db():
                 received_by TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
+        ensure_col(cur, "sales_payments", "created_at", "TIMESTAMP")
 
+        # 3. Products & Inventory Movements (with legacy auto-migration)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -338,9 +390,15 @@ def init_db():
                 branch TEXT DEFAULT 'สำนักงานใหญ่',
                 min_stock INTEGER DEFAULT 10
             )""")
+        ensure_col(cur, "products", "branch", "TEXT DEFAULT 'สำนักงานใหญ่'")
         ensure_col(cur, "products", "min_stock", "INTEGER DEFAULT 10")
         cur.execute("UPDATE products SET min_stock = 10 WHERE min_stock IS NULL")
 
+        legacy_inv = archive_if_incompatible(
+            cur,
+            "inventory_movements",
+            {"product_id", "movement_type", "quantity", "balance_after", "reference", "created_by"},
+        )
         cur.execute("""
             CREATE TABLE IF NOT EXISTS inventory_movements (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -352,7 +410,31 @@ def init_db():
                 created_by TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
+        ensure_col(cur, "inventory_movements", "created_at", "TIMESTAMP")
+        if legacy_inv:
+            valid_pids = {r["id"] for r in cur.execute("SELECT id FROM products").fetchall()}
+            for r in cur.execute(f'SELECT * FROM "{legacy_inv}"').fetchall():
+                d = dict(r)
+                pid = d.get("product_id")
+                raw_qty = d.get("quantity") if d.get("quantity") is not None else d.get("qty")
+                if pid not in valid_pids or raw_qty is None:
+                    continue
+                qty_int = abs(int(raw_qty))
+                if qty_int <= 0:
+                    continue
+                raw_type = str(d.get("movement_type") or d.get("type") or "").strip().lower()
+                mv_type = "Issue" if raw_type in ("issue", "out", "withdraw", "เบิกออก") else "Receipt"
+                bal = max(int(d.get("balance_after") or 0), 0)
+                ref = str(d.get("reference") or d.get("note") or d.get("reason") or "ข้อมูลเดิม").strip() or "ข้อมูลเดิม"
+                by = str(d.get("created_by") or d.get("user_name") or "System").strip() or "System"
+                cur.execute(
+                    """INSERT INTO inventory_movements
+                       (product_id, movement_type, quantity, balance_after, reference, created_by, created_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (pid, mv_type, qty_int, bal, ref, by, d.get("created_at")),
+                )
 
+        # 4. CRM Customers
         cur.execute("""
             CREATE TABLE IF NOT EXISTS crm_customers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -363,7 +445,17 @@ def init_db():
                 tier TEXT DEFAULT 'Silver',
                 points INTEGER DEFAULT 0
             )""")
+        ensure_col(cur, "crm_customers", "phone", "TEXT")
+        ensure_col(cur, "crm_customers", "email", "TEXT")
+        ensure_col(cur, "crm_customers", "tier", "TEXT DEFAULT 'Silver'")
+        ensure_col(cur, "crm_customers", "points", "INTEGER DEFAULT 0")
 
+        # 5. Purchase Orders (with legacy auto-migration)
+        legacy_po = archive_if_incompatible(
+            cur,
+            "purchase_orders",
+            {"po_no", "vendor_name", "item_name", "qty", "total_amount", "status"},
+        )
         cur.execute("""
             CREATE TABLE IF NOT EXISTS purchase_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -381,7 +473,34 @@ def init_db():
         ensure_col(cur, "purchase_orders", "branch", "TEXT DEFAULT 'สำนักงานใหญ่'")
         ensure_col(cur, "purchase_orders", "requested_by", "TEXT")
         ensure_col(cur, "purchase_orders", "approved_by", "TEXT")
+        ensure_col(cur, "purchase_orders", "created_at", "TIMESTAMP")
+        if legacy_po:
+            for r in cur.execute(f'SELECT * FROM "{legacy_po}"').fetchall():
+                d = dict(r)
+                cur.execute(
+                    """INSERT OR IGNORE INTO purchase_orders
+                       (po_no, vendor_name, item_name, qty, total_amount, status, branch, requested_by, approved_by, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        d.get("po_no") or d.get("po_number") or f"PO-LEGACY-{d.get('id')}",
+                        d.get("vendor_name") or d.get("supplier") or "ไม่ระบุ",
+                        d.get("item_name") or "รายการเดิม",
+                        max(int(d.get("qty") or 1), 1),
+                        float(d.get("total_amount") or d.get("total") or 0),
+                        d.get("status") or "Pending Approval",
+                        d.get("branch") or "สำนักงานใหญ่",
+                        d.get("requested_by"),
+                        d.get("approved_by"),
+                        d.get("created_at"),
+                    ),
+                )
 
+        # 6. Expenses (with legacy auto-migration)
+        legacy_exp = archive_if_incompatible(
+            cur,
+            "expenses",
+            {"exp_no", "category", "description", "amount", "approved_by"},
+        )
         cur.execute("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -393,9 +512,28 @@ def init_db():
                 status TEXT NOT NULL DEFAULT 'Pending Approval',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
+        ensure_col(cur, "expenses", "approved_by", "TEXT")
         ensure_col(cur, "expenses", "status", "TEXT NOT NULL DEFAULT 'Pending Approval'")
+        ensure_col(cur, "expenses", "created_at", "TIMESTAMP")
+        if legacy_exp:
+            for r in cur.execute(f'SELECT * FROM "{legacy_exp}"').fetchall():
+                d = dict(r)
+                cur.execute(
+                    """INSERT OR IGNORE INTO expenses
+                       (exp_no, category, description, amount, approved_by, created_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (
+                        d.get("exp_no") or d.get("expense_no") or f"EXP-LEGACY-{d.get('id')}",
+                        d.get("category") or "อื่นๆ",
+                        d.get("description") or d.get("title") or "รายการเดิม",
+                        float(d.get("amount") or d.get("total") or 0),
+                        d.get("approved_by") or d.get("created_by"),
+                        d.get("created_at"),
+                    ),
+                )
         cur.execute("UPDATE expenses SET status = 'Approved' WHERE status = 'Pending Approval' AND approved_by IS NOT NULL")
 
+        # 7. Employees & Payroll
         cur.execute("""
             CREATE TABLE IF NOT EXISTS employees (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -406,6 +544,7 @@ def init_db():
                 department TEXT NOT NULL,
                 status TEXT DEFAULT 'Active'
             )""")
+        ensure_col(cur, "employees", "status", "TEXT DEFAULT 'Active'")
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS payroll_runs (
@@ -428,6 +567,7 @@ def init_db():
                 UNIQUE(payroll_run_id, employee_id)
             )""")
 
+        # 8. Journal Entries
         cur.execute("""
             CREATE TABLE IF NOT EXISTS journal_entries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -439,7 +579,9 @@ def init_db():
                 description TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
+        ensure_col(cur, "journal_entries", "created_at", "TIMESTAMP")
 
+        # 9. Approvals
         cur.execute("""
             CREATE TABLE IF NOT EXISTS approvals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -454,7 +596,9 @@ def init_db():
             )""")
         ensure_col(cur, "approvals", "approved_by", "TEXT")
         ensure_col(cur, "approvals", "document_id", "INTEGER")
+        ensure_col(cur, "approvals", "created_at", "TIMESTAMP")
 
+        # 10. Audit Logs
         cur.execute("""
             CREATE TABLE IF NOT EXISTS audit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -478,6 +622,32 @@ def log_audit(user_name: str, action: str):
         conn.commit()
     except sqlite3.Error:
         safe_rollback(conn)
+    finally:
+        conn.close()
+
+
+def delete_audit_logs(log_ids=None) -> int:
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        if log_ids is None:
+            cur.execute("DELETE FROM audit_logs")
+            deleted = max(cur.rowcount, 0)
+            if table_exists(cur, "sqlite_sequence"):
+                cur.execute("DELETE FROM sqlite_sequence WHERE name='audit_logs'")
+        else:
+            clean_ids = [int(i) for i in log_ids]
+            if not clean_ids:
+                raise ValueError("กรุณาเลือกรายการ Audit Log อย่างน้อย 1 รายการ")
+            placeholders = ",".join("?" for _ in clean_ids)
+            cur.execute(f"DELETE FROM audit_logs WHERE id IN ({placeholders})", clean_ids)
+            deleted = max(cur.rowcount, 0)
+        conn.commit()
+        return deleted
+    except Exception:
+        safe_rollback(conn)
+        raise
     finally:
         conn.close()
 
@@ -546,7 +716,8 @@ def reset_tables(table_names, actor=None, include_extra=False):
 def delete_record(table: str, rec_id: int, actor: str, self_id: int = None):
     allowed = {
         "sales", "products", "crm_customers", "purchase_orders",
-        "expenses", "employees", "journal_entries", "approvals", "users",
+        "expenses", "employees", "journal_entries", "approvals",
+        "audit_logs", "users",
     }
     if table not in allowed:
         raise ValueError("ไม่สามารถลบข้อมูลจากตารางนี้ได้")
@@ -571,6 +742,8 @@ def delete_record(table: str, rec_id: int, actor: str, self_id: int = None):
             cur.execute("DELETE FROM sales_payments WHERE sale_id=?", (rec_id,))
         elif table == "products":
             cur.execute("DELETE FROM inventory_movements WHERE product_id=?", (rec_id,))
+            if table_exists(cur, "purchase_order_items"):
+                cur.execute("DELETE FROM purchase_order_items WHERE product_id=?", (rec_id,))
         elif table == "employees":
             cur.execute("DELETE FROM payroll_items WHERE employee_id=?", (rec_id,))
         elif table == "purchase_orders":
@@ -579,11 +752,12 @@ def delete_record(table: str, rec_id: int, actor: str, self_id: int = None):
             cur.execute("DELETE FROM approvals WHERE doc_type='EXPENSE' AND document_id=?", (rec_id,))
         cur.execute(f'DELETE FROM "{table}" WHERE id=?', (rec_id,))
         if cur.rowcount != 1:
-            raise ValueError("ไม่พบรายการที่ต้องการลบ")
-        cur.execute(
-            "INSERT INTO audit_logs (user_name, action) VALUES (?, ?)",
-            (str(actor), f"ลบรายการ ID #{rec_id} จากตาราง {table}"),
-        )
+            raise ValueError("ไม่พบรายการที่ต้องการลบ หรือรายการนี้ถูกลบไปแล้ว")
+        if table != "audit_logs":
+            cur.execute(
+                "INSERT INTO audit_logs (user_name, action) VALUES (?, ?)",
+                (str(actor), f"ลบรายการ ID #{rec_id} จากตาราง {table}"),
+            )
         conn.commit()
     except Exception:
         safe_rollback(conn)
@@ -693,6 +867,8 @@ def process_approval(app_id: int, status: str, actor: str):
             "UPDATE approvals SET status=?, approved_by=? WHERE id=? AND status='Pending Approval'",
             (status, actor, app_id),
         )
+        if cur.rowcount != 1:
+            raise ValueError("สถานะคำขอเปลี่ยนแปลงแล้ว กรุณาโหลดหน้าใหม่")
         if row["doc_type"] == "PO" and row["document_id"] is not None:
             cur.execute(
                 "UPDATE purchase_orders SET status=?, approved_by=? WHERE id=? AND status IN ('Pending Approval','Pending')",
@@ -705,7 +881,7 @@ def process_approval(app_id: int, status: str, actor: str):
             ).fetchone()
             if exp:
                 cur.execute(
-                    "UPDATE expenses SET status=?, approved_by=CASE WHEN ?='Approved' THEN ? ELSE NULL END WHERE id=?",
+                    "UPDATE expenses SET status=?, approved_by=CASE WHEN ?='Approved' THEN ? ELSE NULL END WHERE id=? AND status='Pending Approval'",
                     (status, status, actor, row["document_id"]),
                 )
                 if status == "Approved":
@@ -797,9 +973,11 @@ def pay_payroll(run_id: int) -> float:
             "SELECT COUNT(*), COALESCE(SUM(gross_pay),0), COALESCE(SUM(deductions),0), COALESCE(SUM(net_pay),0) FROM payroll_items WHERE payroll_run_id=?",
             (run_id,),
         ).fetchone()
-        gross, ded, net = float(gross), float(ded), float(net)
+        gross, ded, net = round(float(gross), 2), round(float(ded), 2), round(float(net), 2)
         if cnt == 0:
             raise ValueError("ไม่มีรายการพนักงานในรอบเงินเดือนนี้")
+        if not math.isclose(gross, ded + net, abs_tol=0.01):
+            raise ValueError("ยอดเงินเดือนและรายการหักไม่สมดุล กรุณาตรวจสอบรายการหักอีกครั้ง")
         today_s = date.today().isoformat()
         entries = []
         if gross > 0:
@@ -817,6 +995,8 @@ def pay_payroll(run_id: int) -> float:
             "UPDATE payroll_runs SET status='Paid', paid_at=CURRENT_TIMESTAMP WHERE id=? AND status='Draft'",
             (run_id,),
         )
+        if cur.rowcount != 1:
+            raise ValueError("สถานะรอบเงินเดือนเปลี่ยนแปลงแล้ว กรุณาโหลดหน้าใหม่")
         conn.commit()
         return net
     except Exception:
@@ -826,11 +1006,11 @@ def pay_payroll(run_id: int) -> float:
         conn.close()
 
 
-# Initialize database once per session
-if not st.session_state.get("_db_ready") or not os.path.exists(DB_FILE):
+# Initialize & auto-migrate database once per session
+if not st.session_state.get("_db_ready_v73") or not os.path.exists(DB_FILE):
     try:
         init_db()
-        st.session_state["_db_ready"] = True
+        st.session_state["_db_ready_v73"] = True
     except (sqlite3.Error, ValueError) as err:
         st.error(f"ไม่สามารถเตรียมฐานข้อมูลได้: {err}")
         st.stop()
@@ -846,16 +1026,21 @@ if not st.session_state.authenticated or not st.session_state.user:
     st.session_state.authenticated = False
     st.session_state.user = None
 
-    conn = get_conn()
+    conn = None
     try:
+        conn = get_conn()
         user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    except sqlite3.Error as err:
+        st.error(f"ไม่สามารถอ่านข้อมูลผู้ใช้จากฐานข้อมูลได้: {err}")
+        st.stop()
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
     if user_count == 0:
         show_flash()
         st.markdown("## 🛡️ ตั้งค่าผู้ดูแลระบบคนแรก (Initial Admin Setup)")
-        st.info("สร้างบัญชี Admin คนแรกเพื่อเริ่มต้นใช้งาน TaxMate ERP v7.0")
+        st.info("สร้างบัญชี Admin คนแรกเพื่อเริ่มต้นใช้งาน TaxMate ERP v7.3")
         with st.form("init_admin_form"):
             u0 = st.text_input("ชื่อผู้ดูแลระบบ (Username)")
             fn0 = st.text_input("ชื่อ-นามสกุล")
@@ -874,15 +1059,16 @@ if not st.session_state.authenticated or not st.session_state.user:
                 created = None
                 conn = get_conn()
                 try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
+                    cur = conn.cursor()
+                    cur.execute("BEGIN IMMEDIATE")
+                    if cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
                         raise ValueError("มีบัญชีผู้ใช้แล้ว กรุณาเข้าสู่ระบบ")
-                    conn.execute(
+                    cur.execute(
                         "INSERT INTO users (username, password_hash, full_name, role, department, email, status) VALUES (?,?,?,'Admin','บริหารและจัดการ',?,'Active')",
                         (u0.strip(), hash_password(p0), fn0.strip(), em0.strip()),
                     )
                     conn.commit()
-                    created = dict(conn.execute("SELECT * FROM users WHERE username=?", (u0.strip(),)).fetchone())
+                    created = dict(cur.execute("SELECT * FROM users WHERE username=?", (u0.strip(),)).fetchone())
                 except (ValueError, sqlite3.Error) as err:
                     safe_rollback(conn)
                     st.error(f"สร้างบัญชีไม่สำเร็จ: {err}")
@@ -897,7 +1083,7 @@ if not st.session_state.authenticated or not st.session_state.user:
         st.stop()
 
     with st.sidebar:
-        st.markdown("### 🏛️ TaxMate ERP v7.0")
+        st.markdown("### 🏛️ TaxMate ERP v7.3")
         init_nav = st.radio("📍 เมนูระบบ:", ["🔑 เข้าสู่ระบบ / สมัครสมาชิก", "🏠 หน้าแรก (Overview)"])
         st.divider()
         st.caption("🟢 ฐานข้อมูล SQLite พร้อมใช้งาน")
@@ -908,7 +1094,7 @@ if not st.session_state.authenticated or not st.session_state.user:
         st.markdown(
             """
         <div class="hero-box">
-            <span class="hero-pill">🏛️ ALL-IN-ONE ENTERPRISE ERP v7.0</span>
+            <span class="hero-pill">🏛️ ALL-IN-ONE ENTERPRISE ERP v7.3</span>
             <div class="hero-title">TaxMate Enterprise ERP Suite</div>
             <div class="hero-sub">Admin Center • User Portal • e-Tax • Accounting • WMS • HR</div>
             <div class="hero-desc">ระบบบริหารจัดการองค์กรครบวงจร รองรับการแยกหน้าผู้ดูแลระบบ (Admin Center) และหน้าผู้ใช้งานทั่วไป (User Portal) พร้อมใบกำกับภาษี VAT 7% Dynamic PromptPay QR สต็อกสินค้า CRM จัดซื้อ ค่าใช้จ่าย เงินเดือน และลงบัญชีคู่ครบถ้วน</div>
@@ -930,22 +1116,32 @@ if not st.session_state.authenticated or not st.session_state.user:
                 u_in = st.text_input("ชื่อผู้ใช้งาน (Username)")
                 p_in = st.text_input("รหัสผ่าน (Password)", type="password")
                 if st.form_submit_button("เข้าสู่ระบบ", type="primary"):
-                    conn = get_conn()
+                    found = None
+                    db_err = False
+                    conn = None
                     try:
-                        found = conn.execute("SELECT * FROM users WHERE username=?", (u_in.strip(),)).fetchone()
+                        conn = get_conn()
+                        found = conn.execute(
+                            "SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (u_in.strip(),)
+                        ).fetchone()
+                    except sqlite3.Error as err:
+                        st.error(f"เข้าสู่ระบบไม่สำเร็จเนื่องจากฐานข้อมูลขัดข้อง: {err}")
+                        db_err = True
                     finally:
-                        conn.close()
-                    if found and verify_password(p_in, found["password_hash"]):
-                        if str(found["status"] or "").strip().casefold() != "active":
-                            st.error(f"บัญชีนี้อยู่ในสถานะ '{found['status']}' กรุณาติดต่อผู้ดูแลระบบ")
+                        if conn:
+                            conn.close()
+                    if not db_err:
+                        if found and verify_password(p_in, found["password_hash"]):
+                            if str(found["status"] or "").strip().casefold() != "active":
+                                st.error(f"บัญชีนี้อยู่ในสถานะ '{found['status']}' กรุณาติดต่อผู้ดูแลระบบ")
+                            else:
+                                st.session_state.authenticated = True
+                                st.session_state.user = dict(found)
+                                log_audit(found["full_name"], "เข้าสู่ระบบสำเร็จ")
+                                set_flash("success", f"ยินดีต้อนรับคุณ {found['full_name']} ({role_label(found['role'])})")
+                                st.rerun()
                         else:
-                            st.session_state.authenticated = True
-                            st.session_state.user = dict(found)
-                            log_audit(found["full_name"], "เข้าสู่ระบบสำเร็จ")
-                            set_flash("success", f"ยินดีต้อนรับคุณ {found['full_name']} ({role_label(found['role'])})")
-                            st.rerun()
-                    else:
-                        st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
+                            st.error("ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง")
 
         with t_up:
             st.info("เลือกสร้างบัญชี **Admin (ผู้ดูแลระบบ)** หรือ **User (ผู้ใช้งานทั่วไป)** เพื่อเข้าใช้งานได้ทันที")
@@ -968,12 +1164,19 @@ if not st.session_state.authenticated or not st.session_state.user:
                         ok = False
                         conn = get_conn()
                         try:
-                            conn.execute(
+                            cur = conn.cursor()
+                            cur.execute("BEGIN IMMEDIATE")
+                            if username_exists(cur, ru):
+                                raise ValueError("ชื่อผู้ใช้นี้มีอยู่แล้ว กรุณาใช้ชื่ออื่น")
+                            cur.execute(
                                 "INSERT INTO users (username, password_hash, full_name, role, department, email, status) VALUES (?,?,?,?,?,?,'Active')",
                                 (ru.strip(), hash_password(rp1), rfn.strip(), rrole, rdept.strip() or "ทั่วไป", rem.strip()),
                             )
                             conn.commit()
                             ok = True
+                        except ValueError as err:
+                            safe_rollback(conn)
+                            st.error(str(err))
                         except sqlite3.IntegrityError:
                             safe_rollback(conn)
                             st.error("ชื่อผู้ใช้นี้มีอยู่แล้ว")
@@ -990,11 +1193,16 @@ if not st.session_state.authenticated or not st.session_state.user:
 # ------------------------------------------------------------------------------
 # 6. LOGGED-IN SESSION & ROLE NAVIGATION
 # ------------------------------------------------------------------------------
-conn = get_conn()
+conn = None
 try:
+    conn = get_conn()
     fetched = conn.execute("SELECT * FROM users WHERE id=?", (st.session_state.user.get("id"),)).fetchone()
+except sqlite3.Error as err:
+    st.error(f"ไม่สามารถตรวจสอบสถานะบัญชีได้: {err}")
+    st.stop()
 finally:
-    conn.close()
+    if conn:
+        conn.close()
 
 if not fetched or str(fetched["status"] or "").strip().casefold() != "active":
     st.session_state.clear()
@@ -1054,7 +1262,7 @@ avail_menus = [m for m, r in menu_perms.items() if user_role in r] or ["👤 ห
 app_menu = st.sidebar.radio("ระบบงานหลัก", avail_menus)
 
 st.sidebar.markdown("---")
-if st.sidebar.button("🚪 ออกจากระบบ", use_container_width=True):
+if ui_button("🚪 ออกจากระบบ", container=st.sidebar, key="btn_logout"):
     log_audit(user["full_name"], "ออกจากระบบ")
     st.session_state.clear()
     st.session_state.authenticated = False
@@ -1143,15 +1351,21 @@ if app_menu == "👤 หน้าผู้ใช้งาน (User Portal)":
                     elif npw != npwc:
                         st.error("รหัสผ่านใหม่ไม่ตรงกัน")
                     else:
+                        ok = False
                         conn = get_conn()
                         try:
                             conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(npw), int(user["id"])))
                             conn.commit()
+                            ok = True
+                        except sqlite3.Error as err:
+                            safe_rollback(conn)
+                            st.error(f"เปลี่ยนรหัสผ่านไม่สำเร็จ: {err}")
                         finally:
                             conn.close()
-                        log_audit(user["full_name"], "เปลี่ยนรหัสผ่านบัญชีตนเอง")
-                        set_flash("success", "เปลี่ยนรหัสผ่านเรียบร้อยแล้ว")
-                        st.rerun()
+                        if ok:
+                            log_audit(user["full_name"], "เปลี่ยนรหัสผ่านบัญชีตนเอง")
+                            set_flash("success", "เปลี่ยนรหัสผ่านเรียบร้อยแล้ว")
+                            st.rerun()
 
     with ut2:
         with st.form("u_qa_form"):
@@ -1165,6 +1379,7 @@ if app_menu == "👤 หน้าผู้ใช้งาน (User Portal)":
                 if not qtitle.strip():
                     st.error("กรุณาระบุรายละเอียดคำขอ")
                 else:
+                    ok = False
                     conn = get_conn()
                     try:
                         conn.execute(
@@ -1172,15 +1387,20 @@ if app_menu == "👤 หน้าผู้ใช้งาน (User Portal)":
                             (qt, qtitle.strip(), round(float(qa), 2), user["full_name"]),
                         )
                         conn.commit()
+                        ok = True
+                    except sqlite3.Error as err:
+                        safe_rollback(conn)
+                        st.error(f"ส่งคำขอไม่สำเร็จ: {err}")
                     finally:
                         conn.close()
-                    log_audit(user["full_name"], f"ส่งคำขอจาก User Portal: {qtitle.strip()}")
-                    set_flash("success", "ส่งคำขออนุมัติเรียบร้อยแล้ว")
-                    st.rerun()
-        st.dataframe(my_app, use_container_width=True, hide_index=True)
+                    if ok:
+                        log_audit(user["full_name"], f"ส่งคำขอจาก User Portal: {qtitle.strip()}")
+                        set_flash("success", "ส่งคำขออนุมัติเรียบร้อยแล้ว")
+                        st.rerun()
+        ui_dataframe(my_app, hide_index=True)
 
     with ut3:
-        st.dataframe(my_log, use_container_width=True, hide_index=True)
+        ui_dataframe(my_log, hide_index=True)
 
 # ------------------------------------------------------------------------------
 # MODULE: ADMIN CENTER
@@ -1225,12 +1445,19 @@ elif app_menu == "🛡️ หน้าผู้ดูแลระบบ (Admin C
                         ok = False
                         conn = get_conn()
                         try:
-                            conn.execute(
+                            cur = conn.cursor()
+                            cur.execute("BEGIN IMMEDIATE")
+                            if username_exists(cur, nu):
+                                raise ValueError("ชื่อผู้ใช้นี้มีอยู่แล้ว กรุณาใช้ชื่ออื่น")
+                            cur.execute(
                                 "INSERT INTO users (username, password_hash, full_name, role, department, email, status) VALUES (?,?,?,?,?,?,?)",
                                 (nu.strip(), hash_password(np1), nfn.strip(), nrole, ndept.strip(), nem.strip(), nstat),
                             )
                             conn.commit()
                             ok = True
+                        except ValueError as err:
+                            safe_rollback(conn)
+                            st.error(str(err))
                         except sqlite3.IntegrityError:
                             safe_rollback(conn)
                             st.error("ชื่อผู้ใช้นี้มีอยู่แล้ว")
@@ -1244,21 +1471,22 @@ elif app_menu == "🛡️ หน้าผู้ดูแลระบบ (Admin C
                             set_flash("success", f"ลงทะเบียน {nu.strip()} เรียบร้อยแล้ว")
                             st.rerun()
 
-        st.dataframe(df_u, use_container_width=True, hide_index=True)
+        ui_dataframe(df_u, hide_index=True)
         if u_rows:
             u_opts = {f"{r['username']} · {r['full_name']} · {r['role']} · {r['status']}": r for r in u_rows}
-            sel_u = u_opts[st.selectbox("เลือกบัญชีเพื่อแก้ไข", list(u_opts), key="adm_sel_u")]
+            sel_u = u_opts[st.selectbox("เลือกบัญชีเพื่อแก้ไขหรือลบ", list(u_opts), key="adm_sel_u")]
             is_self = int(sel_u["id"]) == int(user["id"])
             st_opts = ["Active", "Pending", "Inactive"]
             with st.form("adm_edit_u"):
                 erole = st.selectbox("บทบาท", ADMIN_EDIT_ROLES, index=ADMIN_EDIT_ROLES.index(sel_u["role"]) if sel_u["role"] in ADMIN_EDIT_ROLES else 2, format_func=role_label, disabled=is_self, key=f"er_{sel_u['id']}")
                 estat = st.selectbox("สถานะ", st_opts, index=st_opts.index(sel_u["status"]) if sel_u["status"] in st_opts else 0, disabled=is_self, key=f"es_{sel_u['id']}")
                 rpw = st.text_input("ตั้งรหัสผ่านใหม่ (เว้นว่างหากไม่เปลี่ยน)", type="password", key=f"ep_{sel_u['id']}")
-                if st.form_submit_button("บันทึกบัญชีผู้ใช้", type="primary"):
+                if st.form_submit_button("💾 บันทึกบัญชีผู้ใช้", type="primary"):
                     if rpw and len(rpw) < 4:
                         st.error("รหัสผ่านใหม่ต้องมีอย่างน้อย 4 ตัวอักษร")
                     else:
                         ok = False
+                        f_role, f_stat = sel_u["role"], sel_u["status"]
                         conn = get_conn()
                         try:
                             cur = conn.cursor()
@@ -1287,10 +1515,64 @@ elif app_menu == "🛡️ หน้าผู้ดูแลระบบ (Admin C
                             set_flash("success", "บันทึกบัญชีผู้ใช้เรียบร้อยแล้ว")
                             st.rerun()
 
+            if not is_self:
+                with st.expander(f"🗑️ ลบบัญชีผู้ใช้ '{sel_u['username']}'"):
+                    with st.form(f"adm_del_u_{sel_u['id']}"):
+                        chk_del_u = st.checkbox(f"ยืนยันลบบัญชี {sel_u['username']} ({sel_u['full_name']}) อย่างถาวร")
+                        if st.form_submit_button("🗑️ ลบบัญชีผู้ใช้นี้", type="primary"):
+                            if not chk_del_u:
+                                st.error("กรุณาติ๊กยืนยันก่อนลบบัญชี")
+                            else:
+                                try:
+                                    delete_record("users", int(sel_u["id"]), user["full_name"], self_id=int(user["id"]))
+                                except (ValueError, sqlite3.Error) as err:
+                                    st.error(str(err))
+                                else:
+                                    set_flash("success", f"ลบบัญชี {sel_u['username']} เรียบร้อยแล้ว")
+                                    st.rerun()
+
     with a2:
-        st.dataframe(df_log, use_container_width=True, hide_index=True)
+        ui_dataframe(df_log, hide_index=True)
         if not df_log.empty:
             st.download_button("⬇️ ดาวน์โหลด Audit Logs (CSV)", df_log.to_csv(index=False).encode("utf-8-sig"), f"taxmate_audit_{date.today().isoformat()}.csv", "text/csv")
+            st.markdown("---")
+            st.subheader("🗑️ ลบประวัติ Audit Logs")
+            col_del_sel, col_del_all = st.columns(2)
+            with col_del_sel:
+                log_map = {
+                    f"#{int(r['id'])} · {r['user_name']} · {r['action']} · {r['timestamp']}": int(r["id"])
+                    for _, r in df_log.iterrows()
+                }
+                with st.form("del_selected_logs_form"):
+                    picked_logs = st.multiselect("เลือกรายการ Audit Logs ที่ต้องการลบ (เลือกได้หลายรายการ)", list(log_map.keys()))
+                    if st.form_submit_button("🗑️ ลบรายการที่เลือก", type="primary"):
+                        if not picked_logs:
+                            st.error("กรุณาเลือกรายการที่ต้องการลบอย่างน้อย 1 รายการ")
+                        else:
+                            try:
+                                removed = delete_audit_logs([log_map[k] for k in picked_logs])
+                            except (ValueError, sqlite3.Error) as err:
+                                st.error(f"ลบไม่สำเร็จ: {err}")
+                            else:
+                                set_flash("success", f"ลบ Audit Logs เรียบร้อยแล้ว ({removed:,} รายการ)")
+                                st.rerun()
+            with col_del_all:
+                with st.form("clear_all_logs_form"):
+                    st.caption(f"ล้างประวัติการใช้งานทั้งหมด {len(df_log):,} รายการให้เหลือ 0")
+                    chk_clear_logs = st.checkbox("ยืนยันลบ Audit Logs ทั้งหมดอย่างถาวร")
+                    if st.form_submit_button("🔥 ล้าง Audit Logs ทั้งหมด", type="primary"):
+                        if not chk_clear_logs:
+                            st.error("กรุณาติ๊กยืนยันก่อนล้างประวัติทั้งหมด")
+                        else:
+                            try:
+                                removed = delete_audit_logs(None)
+                            except (ValueError, sqlite3.Error) as err:
+                                st.error(f"ล้างประวัติไม่สำเร็จ: {err}")
+                            else:
+                                set_flash("success", f"ล้างประวัติ Audit Logs ทั้งหมดเรียบร้อยแล้ว ({removed:,} รายการ)")
+                                st.rerun()
+        else:
+            st.info("ไม่มีรายการ Audit Logs ในระบบ")
 
 # ------------------------------------------------------------------------------
 # MODULE: DASHBOARD OVERVIEW
@@ -1328,7 +1610,7 @@ elif app_menu == "📊 Dashboard Overview":
             cs = df_s.copy()
             cs["amount"] = cs["amount"].fillna(0.0)
             cs["tax"] = cs["tax"].fillna(0.0)
-            st.plotly_chart(px.bar(cs, x="doc_no", y=["amount", "tax"], barmode="stack", title="มูลค่าก่อน VAT และภาษีขาย"), use_container_width=True)
+            ui_plotly(px.bar(cs, x="doc_no", y=["amount", "tax"], barmode="stack", title="มูลค่าก่อน VAT และภาษีขาย"))
         else:
             st.info("ยังไม่มีข้อมูลการขาย")
     with c2:
@@ -1337,7 +1619,7 @@ elif app_menu == "📊 Dashboard Overview":
             ss = df_s.assign(status=df_s["status"].fillna("ไม่ระบุ"), total=df_s["total"].fillna(0.0)).groupby("status", as_index=False)["total"].sum()
             ss = ss[ss["total"] > 0]
             if not ss.empty:
-                st.plotly_chart(px.pie(ss, names="status", values="total", hole=0.4), use_container_width=True)
+                ui_plotly(px.pie(ss, names="status", values="total", hole=0.4))
             else:
                 st.info("ยังไม่มีข้อมูลยอดชำระเงิน")
         else:
@@ -1357,9 +1639,10 @@ elif app_menu == "🧾 e-Tax Invoice & Dynamic QR":
         pm = st.selectbox("ช่องทางชำระเงิน", ["โอนเงินผ่านธนาคาร", "PromptPay", "บัตรเครดิต", "เงินสด"], key="etax_pm")
         pp_id = st.text_input("PromptPay เบอร์มือถือ / เลขผู้เสียภาษี", placeholder="เช่น 0812345678", key="etax_pp") if pm == "PromptPay" else ""
         st_val = st.selectbox("สถานะ", ["ชำระแล้ว", "รอชำระ"], index=1, key="etax_st")
-        vat, tot = round(amt * 0.07, 2), round(amt * 1.07, 2)
+        vat = round(amt * 0.07, 2)
+        tot = round(amt + vat, 2)
 
-        if st.button("💾 บันทึกและออกใบกำกับภาษี", type="primary", use_container_width=True):
+        if ui_button("💾 บันทึกและออกใบกำกับภาษี", type="primary", key="btn_save_etax"):
             valid = True
             if not d_no.strip() or not cust.strip():
                 st.error("กรุณาระบุเลขที่เอกสารและชื่อลูกค้า")
@@ -1451,7 +1734,7 @@ elif app_menu == "🧾 e-Tax Invoice & Dynamic QR":
         conn.close()
 
     st.subheader("📋 รายการใบกำกับภาษีในระบบ")
-    st.dataframe(df_sales, use_container_width=True, hide_index=True)
+    ui_dataframe(df_sales, hide_index=True)
     if not df_sales.empty:
         st.download_button("⬇️ ดาวน์โหลดรายงานขาย (CSV)", df_sales.to_csv(index=False).encode("utf-8-sig"), f"taxmate_sales_{date.today().isoformat()}.csv", "text/csv")
 
@@ -1500,6 +1783,9 @@ elif app_menu == "🤝 ระบบลูกค้าสัมพันธ์ (C
                         except sqlite3.IntegrityError:
                             safe_rollback(conn)
                             st.error("รหัสลูกค้านี้มีอยู่แล้ว")
+                        except sqlite3.Error as err:
+                            safe_rollback(conn)
+                            st.error(f"บันทึกข้อมูลลูกค้าไม่สำเร็จ: {err}")
                         finally:
                             conn.close()
                         if ok:
@@ -1516,10 +1802,10 @@ elif app_menu == "🤝 ระบบลูกค้าสัมพันธ์ (C
         if not df_crm.empty:
             tc = df_crm["tier"].fillna("Silver").value_counts().reset_index()
             tc.columns = ["tier", "count"]
-            st.plotly_chart(px.pie(tc, names="tier", values="count", title="สัดส่วนระดับสมาชิกลูกค้า", hole=0.35), use_container_width=True)
+            ui_plotly(px.pie(tc, names="tier", values="count", title="สัดส่วนระดับสมาชิกลูกค้า", hole=0.35))
         else:
             st.info("ยังไม่มีข้อมูลลูกค้า")
-    st.dataframe(df_crm, use_container_width=True, hide_index=True)
+    ui_dataframe(df_crm, hide_index=True)
 
 # ------------------------------------------------------------------------------
 # MODULE: FINANCIAL FORECAST
@@ -1552,7 +1838,7 @@ elif app_menu == "📈 คาดการณ์ทางการเงิน (F
             vals.append(round(base * ((1 + g / 100.0) ** i), 2))
         fig = go.Figure(go.Scatter(x=months, y=vals, mode="lines+markers", line=dict(color="#2563EB", width=4)))
         fig.update_layout(title=f"ประมาณการยอดขาย 6 เดือน (เติบโต {g:+d}%/เดือน)", xaxis_title="เดือน", yaxis_title="บาท")
-        st.plotly_chart(fig, use_container_width=True)
+        ui_plotly(fig)
 
 # ------------------------------------------------------------------------------
 # MODULE: PURCHASE ORDERS
@@ -1587,6 +1873,9 @@ elif app_menu == "🛍️ จัดซื้อและคู่ค้า (Purc
                     except sqlite3.IntegrityError:
                         safe_rollback(conn)
                         st.error("เลขที่ PO นี้มีอยู่แล้ว")
+                    except sqlite3.Error as err:
+                        safe_rollback(conn)
+                        st.error(f"บันทึกใบสั่งซื้อไม่สำเร็จ: {err}")
                     finally:
                         conn.close()
                     if ok:
@@ -1599,7 +1888,7 @@ elif app_menu == "🛍️ จัดซื้อและคู่ค้า (Purc
         df_po = pd.read_sql_query("SELECT * FROM purchase_orders ORDER BY id DESC", conn)
     finally:
         conn.close()
-    st.dataframe(df_po, use_container_width=True, hide_index=True)
+    ui_dataframe(df_po, hide_index=True)
 
 # ------------------------------------------------------------------------------
 # MODULE: EXPENSES
@@ -1634,6 +1923,9 @@ elif app_menu == "💸 คุมงบประมาณและค่าใช
                     except sqlite3.IntegrityError:
                         safe_rollback(conn)
                         st.error("เลขที่ใบสำคัญจ่ายนี้มีอยู่แล้ว")
+                    except sqlite3.Error as err:
+                        safe_rollback(conn)
+                        st.error(f"บันทึกค่าใช้จ่ายไม่สำเร็จ: {err}")
                     finally:
                         conn.close()
                     if ok:
@@ -1651,10 +1943,12 @@ elif app_menu == "💸 คุมงบประมาณและค่าใช
             es = df_exp.assign(category=df_exp["category"].fillna("อื่นๆ"), amount=df_exp["amount"].fillna(0.0)).groupby("category", as_index=False)["amount"].sum()
             es = es[es["amount"] > 0]
             if not es.empty:
-                st.plotly_chart(px.pie(es, names="category", values="amount", title="สัดส่วนค่าใช้จ่ายตามหมวดหมู่", hole=0.35), use_container_width=True)
+                ui_plotly(px.pie(es, names="category", values="amount", title="สัดส่วนค่าใช้จ่ายตามหมวดหมู่", hole=0.35))
+            else:
+                st.info("ยังไม่มีข้อมูลยอดค่าใช้จ่าย")
         else:
             st.info("ยังไม่มีข้อมูลค่าใช้จ่าย")
-    st.dataframe(df_exp, use_container_width=True, hide_index=True)
+    ui_dataframe(df_exp, hide_index=True)
 
 # ------------------------------------------------------------------------------
 # MODULE: SMART INVENTORY WMS
@@ -1688,6 +1982,9 @@ elif app_menu == "📦 Smart Inventory WMS":
                     except sqlite3.IntegrityError:
                         safe_rollback(conn)
                         st.error("รหัสสินค้านี้มีอยู่แล้ว")
+                    except sqlite3.Error as err:
+                        safe_rollback(conn)
+                        st.error(f"บันทึกสินค้าไม่สำเร็จ: {err}")
                     finally:
                         conn.close()
                     if ok:
@@ -1711,7 +2008,7 @@ elif app_menu == "📦 Smart Inventory WMS":
         df_p["min_stock"] = df_p["min_stock"].fillna(10).astype(int)
         if len(df_p[df_p["stock"] <= df_p["min_stock"]]) > 0:
             st.warning("⚠️ มีสินค้าต่ำกว่าจุดแจ้งเตือน กรุณาตรวจสอบสต็อก")
-    st.dataframe(df_p, use_container_width=True, hide_index=True)
+    ui_dataframe(df_p, hide_index=True)
 
     if not df_p.empty:
         p_opts = {f"{r.sku} · {r.name} · คงเหลือ {int(r.stock)} ชิ้น": int(r.id) for r in df_p.itertuples()}
@@ -1731,7 +2028,7 @@ elif app_menu == "📦 Smart Inventory WMS":
                     set_flash("success", f"บันทึกแล้ว · คงเหลือ {ns} ชิ้น")
                     st.rerun()
     st.subheader("📋 ประวัติการเคลื่อนไหวสต็อก")
-    st.dataframe(df_mv, use_container_width=True, hide_index=True)
+    ui_dataframe(df_mv, hide_index=True)
 
 # ------------------------------------------------------------------------------
 # MODULE: HR & PAYROLL
@@ -1757,6 +2054,9 @@ elif app_menu == "👥 HR & Payroll":
                     except sqlite3.IntegrityError:
                         safe_rollback(conn)
                         st.error("รหัสพนักงานนี้มีอยู่แล้ว")
+                    except sqlite3.Error as err:
+                        safe_rollback(conn)
+                        st.error(f"บันทึกพนักงานไม่สำเร็จ: {err}")
                     finally:
                         conn.close()
                     if ok:
@@ -1771,7 +2071,7 @@ elif app_menu == "👥 HR & Payroll":
         runs = conn.execute("SELECT id, period, status FROM payroll_runs ORDER BY period DESC").fetchall()
     finally:
         conn.close()
-    st.dataframe(df_emp, use_container_width=True, hide_index=True)
+    ui_dataframe(df_emp, hide_index=True)
 
     st.markdown("---")
     st.subheader("💸 รอบจ่ายเงินเดือน")
@@ -1801,7 +2101,9 @@ elif app_menu == "👥 HR & Payroll":
         finally:
             conn.close()
         if items:
-            st.dataframe(pd.DataFrame([{"รหัส": i["emp_code"], "ชื่อ": i["name"], "เงินเดือน": i["gross_pay"], "หัก": i["deductions"], "สุทธิ": i["net_pay"]} for i in items]), use_container_width=True, hide_index=True)
+            ui_dataframe(pd.DataFrame([{"รหัส": i["emp_code"], "ชื่อ": i["name"], "เงินเดือน": i["gross_pay"], "หัก": i["deductions"], "สุทธิ": i["net_pay"]} for i in items]), hide_index=True)
+        else:
+            st.info("ไม่มีรายการพนักงานในรอบเงินเดือนนี้")
         if sel_r["status"] == "Draft" and items:
             e_opts = {f"{i['emp_code']} · {i['name']}": i for i in items}
             sel_e = e_opts[st.selectbox("เลือกพนักงานเพื่อปรับยอดหัก", list(e_opts), key=f"pe_{sel_r['id']}")]
@@ -1809,7 +2111,7 @@ elif app_menu == "👥 HR & Payroll":
             cur_d = min(float(sel_e["deductions"]), gross_v)
             if gross_v > 0:
                 with st.form("pr_ded_form"):
-                    dv = st.number_input(f"ยอดหัก (สูงสุด ฿{gross_v:,.2f})", min_value=0.0, value=cur_d, step=100.0, key=f"pd_{sel_r['id']}_{sel_e['employee_id']}_{cur_d:.2f}")
+                    dv = st.number_input(f"ยอดหัก (สูงสุด ฿{gross_v:,.2f})", min_value=0.0, max_value=gross_v, value=cur_d, step=100.0, key=f"pd_{sel_r['id']}_{sel_e['employee_id']}_{cur_d:.2f}")
                     if st.form_submit_button("บันทึกยอดหัก"):
                         try:
                             update_payroll_deduction(sel_r["id"], sel_e["employee_id"], dv)
@@ -1818,7 +2120,7 @@ elif app_menu == "👥 HR & Payroll":
                         else:
                             set_flash("success", "บันทึกยอดหักเรียบร้อยแล้ว")
                             st.rerun()
-            if st.button("ยืนยันจ่ายเงินเดือนและบันทึกบัญชีอัตโนมัติ", type="primary"):
+            if ui_button("ยืนยันจ่ายเงินเดือนและบันทึกบัญชีอัตโนมัติ", type="primary", key=f"btn_pay_pr_{sel_r['id']}"):
                 try:
                     net_p = pay_payroll(sel_r["id"])
                 except (ValueError, sqlite3.Error) as err:
@@ -1858,6 +2160,7 @@ elif app_menu == "📒 บันทึกบัญชีและงบการ
                     st.error("บัญชีเดบิตและเครดิตต้องเป็นคนละบัญชี")
                 else:
                     amt_v = round(float(ja), 2)
+                    ok = False
                     conn = get_conn()
                     try:
                         conn.executemany(
@@ -1868,12 +2171,17 @@ elif app_menu == "📒 บันทึกบัญชีและงบการ
                             ],
                         )
                         conn.commit()
+                        ok = True
+                    except sqlite3.Error as err:
+                        safe_rollback(conn)
+                        st.error(f"บันทึกรายการบัญชีไม่สำเร็จ: {err}")
                     finally:
                         conn.close()
-                    log_audit(user["full_name"], f"บันทึกสมุดรายวัน ฿{amt_v:,.2f}")
-                    set_flash("success", "บันทึกรายการเดบิตและเครดิตเรียบร้อยแล้ว")
-                    st.rerun()
-        st.dataframe(df_j, use_container_width=True, hide_index=True)
+                    if ok:
+                        log_audit(user["full_name"], f"บันทึกสมุดรายวัน ฿{amt_v:,.2f}")
+                        set_flash("success", "บันทึกรายการเดบิตและเครดิตเรียบร้อยแล้ว")
+                        st.rerun()
+        ui_dataframe(df_j, hide_index=True)
         if not df_j.empty:
             st.download_button("⬇️ ดาวน์โหลดสมุดรายวัน (CSV)", df_j.to_csv(index=False).encode("utf-8-sig"), f"taxmate_gl_{date.today().isoformat()}.csv", "text/csv")
 
@@ -1889,7 +2197,7 @@ elif app_menu == "📒 บันทึกบัญชีและงบการ
             c1.metric("รวมเดบิต", f"฿{dr_s:,.2f}")
             c2.metric("รวมเครดิต", f"฿{cr_s:,.2f}")
             c3.metric("สถานะ", "สมดุล" if math.isclose(dr_s, cr_s, abs_tol=0.01) else "ไม่สมดุล")
-            st.dataframe(tb, use_container_width=True, hide_index=True)
+            ui_dataframe(tb, hide_index=True)
 
     with tpl:
         if df_j.empty:
@@ -1904,7 +2212,7 @@ elif app_menu == "📒 บันทึกบัญชีและงบการ
             p1.metric("รายได้รวม (หมวด 4)", f"฿{t_rev:,.2f}")
             p2.metric("ค่าใช้จ่ายรวม (หมวด 5-6)", f"฿{t_exp:,.2f}")
             p3.metric("กำไร (ขาดทุน) สุทธิ", f"฿{net_p:,.2f}")
-            st.plotly_chart(px.bar(pd.DataFrame({"รายการ": ["รายได้รวม", "ค่าใช้จ่ายรวม", "กำไรสุทธิ"], "จำนวนเงิน": [t_rev, t_exp, net_p]}), x="รายการ", y="จำนวนเงิน", title="สรุปงบกำไรขาดทุนเบื้องต้น"), use_container_width=True)
+            ui_plotly(px.bar(pd.DataFrame({"รายการ": ["รายได้รวม", "ค่าใช้จ่ายรวม", "กำไรสุทธิ"], "จำนวนเงิน": [t_rev, t_exp, net_p]}), x="รายการ", y="จำนวนเงิน", title="สรุปงบกำไรขาดทุนเบื้องต้น"))
 
 # ------------------------------------------------------------------------------
 # MODULE: E-APPROVAL
@@ -1918,6 +2226,7 @@ elif app_menu == "🛡️ ระบบขออนุมัติ (E-Approval)":
             if not atitle.strip():
                 st.error("กรุณาระบุเรื่องที่ขออนุมัติ")
             else:
+                ok = False
                 conn = get_conn()
                 try:
                     conn.execute(
@@ -1925,11 +2234,16 @@ elif app_menu == "🛡️ ระบบขออนุมัติ (E-Approval)":
                         (at, atitle.strip(), round(float(aamt), 2), user["full_name"]),
                     )
                     conn.commit()
+                    ok = True
+                except sqlite3.Error as err:
+                    safe_rollback(conn)
+                    st.error(f"ส่งคำขออนุมัติไม่สำเร็จ: {err}")
                 finally:
                     conn.close()
-                log_audit(user["full_name"], f"ส่งคำขออนุมัติ: {atitle.strip()}")
-                set_flash("success", "ส่งคำขออนุมัติเรียบร้อยแล้ว!")
-                st.rerun()
+                if ok:
+                    log_audit(user["full_name"], f"ส่งคำขออนุมัติ: {atitle.strip()}")
+                    set_flash("success", "ส่งคำขออนุมัติเรียบร้อยแล้ว!")
+                    st.rerun()
 
     conn = get_conn()
     try:
@@ -1958,7 +2272,7 @@ elif app_menu == "🛡️ ระบบขออนุมัติ (E-Approval)":
             st.info("ไม่มีคำขอที่รอพิจารณา")
     else:
         st.info("คุณสามารถส่งและติดตามคำขอได้ (สิทธิ์อนุมัติสงวนไว้สำหรับ Admin / ผู้บริหาร)")
-    st.dataframe(df_app, use_container_width=True, hide_index=True)
+    ui_dataframe(df_app, hide_index=True)
 
 # ------------------------------------------------------------------------------
 # MODULE: RESET DATA (ADMIN ONLY)
@@ -1983,9 +2297,13 @@ elif app_menu == "🗑️ ล้างข้อมูลระบบ (Reset Data
                     if not chk1:
                         st.error("กรุณาติ๊กยืนยันก่อนลบ")
                     else:
-                        d_cnt, _ = reset_tables(ALL_TX_TABLES, include_extra=True)
-                        set_flash("success", f"ล้างข้อมูลธุรกรรมเรียบร้อยแล้ว ({d_cnt:,} รายการ)")
-                        st.rerun()
+                        try:
+                            d_cnt, _ = reset_tables(ALL_TX_TABLES, include_extra=True)
+                        except (ValueError, sqlite3.Error) as err:
+                            st.error(f"ล้างข้อมูลไม่สำเร็จ: {err}")
+                        else:
+                            set_flash("success", f"ล้างข้อมูลธุรกรรมเรียบร้อยแล้ว ({d_cnt:,} รายการ)")
+                            st.rerun()
         with col2:
             st.markdown("#### 2. Factory Reset (ลบทุกอย่างรวมบัญชีผู้ใช้)")
             with st.form("rst_all"):
@@ -1994,12 +2312,16 @@ elif app_menu == "🗑️ ล้างข้อมูลระบบ (Reset Data
                     if not chk2:
                         st.error("กรุณาติ๊กยืนยันก่อนลบ")
                     else:
-                        reset_tables(ALL_TX_TABLES + ["users"], include_extra=True)
-                        st.session_state.clear()
-                        st.session_state.authenticated = False
-                        st.session_state.user = None
-                        set_flash("success", "ล้างข้อมูลทั้งหมดเรียบร้อยแล้ว")
-                        st.rerun()
+                        try:
+                            reset_tables(ALL_TX_TABLES + ["users"], include_extra=True)
+                        except (ValueError, sqlite3.Error) as err:
+                            st.error(f"ล้างข้อมูลทั้งหมดไม่สำเร็จ: {err}")
+                        else:
+                            st.session_state.clear()
+                            st.session_state.authenticated = False
+                            st.session_state.user = None
+                            set_flash("success", "ล้างข้อมูลทั้งหมดเรียบร้อยแล้ว")
+                            st.rerun()
 
     with t_part:
         with st.form("rst_part"):
@@ -2010,9 +2332,13 @@ elif app_menu == "🗑️ ล้างข้อมูลระบบ (Reset Data
                     st.error("กรุณาเลือกหมวดข้อมูลและติ๊กยืนยัน")
                 else:
                     tbls = [t for g in grps for t in RESET_GROUPS[g]]
-                    d_cnt, cleared = reset_tables(tbls, actor=user["full_name"])
-                    set_flash("success", f"ลบแล้ว {d_cnt:,} รายการ จาก {len(cleared)} ตาราง")
-                    st.rerun()
+                    try:
+                        d_cnt, cleared = reset_tables(tbls, actor=user["full_name"])
+                    except (ValueError, sqlite3.Error) as err:
+                        st.error(f"ลบข้อมูลไม่สำเร็จ: {err}")
+                    else:
+                        set_flash("success", f"ลบแล้ว {d_cnt:,} รายการ จาก {len(cleared)} ตาราง")
+                        st.rerun()
 
     with t_one:
         cfg = {
@@ -2024,6 +2350,7 @@ elif app_menu == "🗑️ ล้างข้อมูลระบบ (Reset Data
             "👥 พนักงาน (Employees)": ("employees", "SELECT id, emp_code || ' · ' || name || ' · ' || position AS label FROM employees ORDER BY id DESC", ()),
             "📒 สมุดรายวัน (GL)": ("journal_entries", "SELECT id, entry_date || ' · ' || account_code || ' ' || account_name AS label FROM journal_entries ORDER BY id DESC", ()),
             "🛡️ คำขออนุมัติ (Approvals)": ("approvals", "SELECT id, doc_type || ' · ' || title || ' · ' || status AS label FROM approvals ORDER BY id DESC", ()),
+            "📜 ประวัติการใช้งาน (Audit Logs)": ("audit_logs", "SELECT id, user_name || ' · ' || action || ' · ' || COALESCE(timestamp, '') AS label FROM audit_logs ORDER BY id DESC", ()),
             "👤 บัญชีผู้ใช้งานอื่น (Users)": ("users", "SELECT id, username || ' · ' || full_name || ' · ' || role AS label FROM users WHERE id != ? ORDER BY id DESC", (int(user["id"]),)),
         }
         cat = st.selectbox("เลือกหมวดหมู่", list(cfg), key="sdel_cat")
@@ -2038,7 +2365,7 @@ elif app_menu == "🗑️ ล้างข้อมูลระบบ (Reset Data
         else:
             imap = {f"#{r['id']} · {r['label']}": int(r["id"]) for r in i_rows}
             sel_i = st.selectbox("เลือกรายการที่ต้องการลบ", list(imap), key=f"sdel_i_{t_key}")
-            if st.button("🗑️ ลบรายการนี้ถาวร", type="primary"):
+            if ui_button("🗑️ ลบรายการนี้ถาวร", type="primary", key=f"btn_sdel_{t_key}"):
                 try:
                     delete_record(t_key, imap[sel_i], user["full_name"], self_id=int(user["id"]))
                 except (ValueError, sqlite3.Error) as err:

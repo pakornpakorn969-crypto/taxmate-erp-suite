@@ -1,4 +1,8 @@
-__pycache__/
 *.db
-uploads/
-.streamlit/secrets.toml
+*.db-shm
+*.db-wal
+*.log
+*.exe
+__pycache__/
+.venv/
+.DS_Store
